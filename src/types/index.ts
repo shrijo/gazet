@@ -44,6 +44,8 @@ export interface Settings {
   notificationsEnabled: boolean;
   markReadOnScroll: boolean;
   showImages: boolean;
+  showUnreadBadges: boolean;
+  hideReadArticles: boolean;
 }
 
 export type FeedFilter =

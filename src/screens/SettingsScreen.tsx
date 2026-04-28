@@ -99,6 +99,24 @@ export function SettingsScreen() {
           />
         </Row>
 
+        <Row label="Unread Badges" style={divider}>
+          <Switch
+            value={settings.showUnreadBadges}
+            onValueChange={v => updateSettings({ showUnreadBadges: v })}
+            trackColor={{ true: colors.textPrimary }}
+            thumbColor={colors.textInverse}
+          />
+        </Row>
+
+        <Row label="Hide Read Articles" style={divider}>
+          <Switch
+            value={settings.hideReadArticles}
+            onValueChange={v => updateSettings({ hideReadArticles: v })}
+            trackColor={{ true: colors.textPrimary }}
+            thumbColor={colors.textInverse}
+          />
+        </Row>
+
         <ListItem
           left={<Icon name="cloud-upload-outline" size={18} color="secondary" />}
           center={<Text variant="labelMd" color="secondary">Import OPML</Text>}

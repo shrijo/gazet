@@ -4,34 +4,32 @@ import React, {
   useReducer,
   useEffect,
   useCallback,
-  useRef,
 } from 'react';
-import { Folder, Feed, Article, Settings, FeedFilter, ViewMode } from '../types';
+import { Folder, Feed, Settings, FeedFilter, Article } from '../types';
 import * as storage from '../services/storage';
-import { fetchArticles, fetchFeedMeta } from '../services/rss';
-import { upsertArticles } from '../services/storage';
+import * as db from '../services/db';
+import { fetchArticles, fetchFeedMeta, fetchOlderArticles, enrichWithImages } from '../services/rss';
 import { generateId, uuid } from '../utils/id';
 
 interface AppState {
   folders: Folder[];
   feeds: Feed[];
-  articles: Article[];
   settings: Settings;
   filter: FeedFilter;
   loading: boolean;
   refreshing: boolean;
+  articleVersion: number;
 }
 
 type Action =
-  | { type: 'LOAD'; payload: Omit<AppState, 'loading' | 'refreshing' | 'filter'> }
-  | { type: 'SET_LOADING'; payload: boolean }
+  | { type: 'LOAD'; payload: Omit<AppState, 'loading' | 'refreshing' | 'filter' | 'articleVersion'> }
+  | { type: 'SET_LOADING';    payload: boolean }
   | { type: 'SET_REFRESHING'; payload: boolean }
-  | { type: 'SET_FILTER'; payload: FeedFilter }
-  | { type: 'SET_FOLDERS'; payload: Folder[] }
-  | { type: 'SET_FEEDS'; payload: Feed[] }
-  | { type: 'SET_ARTICLES'; payload: Article[] }
-  | { type: 'UPDATE_ARTICLE'; payload: Article }
-  | { type: 'SET_SETTINGS'; payload: Settings };
+  | { type: 'SET_FILTER';     payload: FeedFilter }
+  | { type: 'SET_FOLDERS';    payload: Folder[] }
+  | { type: 'SET_FEEDS';      payload: Feed[] }
+  | { type: 'SET_SETTINGS';   payload: Settings }
+  | { type: 'BUMP_VERSION' };
 
 const DEFAULT_SETTINGS: Settings = {
   viewMode: 'card',
@@ -40,16 +38,18 @@ const DEFAULT_SETTINGS: Settings = {
   notificationsEnabled: false,
   markReadOnScroll: true,
   showImages: true,
+  showUnreadBadges: false,
+  hideReadArticles: false,
 };
 
 const initialState: AppState = {
   folders: [],
   feeds: [],
-  articles: [],
   settings: DEFAULT_SETTINGS,
   filter: { type: 'all' },
   loading: true,
   refreshing: false,
+  articleVersion: 0,
 };
 
 function reducer(state: AppState, action: Action): AppState {
@@ -66,17 +66,10 @@ function reducer(state: AppState, action: Action): AppState {
       return { ...state, folders: action.payload };
     case 'SET_FEEDS':
       return { ...state, feeds: action.payload };
-    case 'SET_ARTICLES':
-      return { ...state, articles: action.payload };
-    case 'UPDATE_ARTICLE':
-      return {
-        ...state,
-        articles: state.articles.map(a =>
-          a.id === action.payload.id ? action.payload : a,
-        ),
-      };
     case 'SET_SETTINGS':
       return { ...state, settings: action.payload };
+    case 'BUMP_VERSION':
+      return { ...state, articleVersion: state.articleVersion + 1 };
     default:
       return state;
   }
@@ -84,22 +77,22 @@ function reducer(state: AppState, action: Action): AppState {
 
 interface AppContextValue {
   state: AppState;
-  filteredArticles: Article[];
   // Feeds
-  addFeed: (url: string, folderId?: string) => Promise<void>;
+  addFeed:    (url: string, folderId?: string) => Promise<void>;
   removeFeed: (feedId: string) => Promise<void>;
-  moveFeed: (feedId: string, folderId?: string) => Promise<void>;
+  moveFeed:   (feedId: string, folderId?: string) => Promise<void>;
   // Folders
-  addFolder: (name: string) => Promise<Folder>;
+  addFolder:    (name: string) => Promise<Folder>;
   renameFolder: (folderId: string, name: string) => Promise<void>;
   removeFolder: (folderId: string) => Promise<void>;
   // Articles
-  markRead: (articleId: string) => Promise<void>;
+  markRead:    (articleId: string) => Promise<void>;
   markAllRead: (feedId: string) => Promise<void>;
-  toggleBookmark: (articleId: string) => Promise<void>;
+  toggleBookmark: (articleId: string) => Promise<boolean>;
   // Refresh
-  refreshAll: () => Promise<void>;
+  refreshAll:  () => Promise<void>;
   refreshFeed: (feed: Feed) => Promise<void>;
+  fetchOlderFromNetwork: (filter: FeedFilter, page: number) => Promise<Article[]>;
   // Filter
   setFilter: (filter: FeedFilter) => void;
   // Settings
@@ -113,49 +106,37 @@ const AppContext = createContext<AppContextValue | null>(null);
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = useReducer(reducer, initialState);
 
-  // Boot: load from storage
+  // Boot: init SQLite, run migrations, then load from storage
   useEffect(() => {
     (async () => {
-      const [folders, feeds, articles, settings] = await Promise.all([
+      db.initDB();
+      await storage.runMigrations();
+      const [folders, feeds, settings] = await Promise.all([
         storage.getFolders(),
         storage.getFeeds(),
-        storage.getArticles(),
         storage.getSettings(),
       ]);
-      dispatch({ type: 'LOAD', payload: { folders, feeds, articles, settings } });
+      dispatch({ type: 'LOAD', payload: { folders, feeds, settings } });
     })();
   }, []);
-
-  // Derived: articles filtered by current filter, sorted newest first
-  const filteredArticles = React.useMemo(() => {
-    const { filter, articles, feeds } = state;
-    let result = articles;
-
-    if (filter.type === 'bookmarks') {
-      result = articles.filter(a => a.isBookmarked);
-    } else if (filter.type === 'feed') {
-      result = articles.filter(a => a.feedId === filter.feedId);
-    } else if (filter.type === 'folder') {
-      const folderFeedIds = new Set(
-        feeds.filter(f => f.folderId === filter.folderId).map(f => f.id),
-      );
-      result = articles.filter(a => folderFeedIds.has(a.feedId));
-    }
-
-    return [...result].sort((a, b) => b.pubDate - a.pubDate);
-  }, [state]);
 
   const refreshFeed = useCallback(async (feed: Feed) => {
     try {
       const { articles, faviconUrl } = await fetchArticles(feed);
-      await upsertArticles(articles);
+      await db.upsertArticles(articles);
       const unreadCount = articles.filter(a => !a.isRead).length;
       const updated = { ...feed, lastFetched: Date.now(), unreadCount, faviconUrl: faviconUrl ?? feed.faviconUrl };
       await storage.saveFeed(updated);
-      const allArticles = await storage.getArticles();
       const allFeeds = await storage.getFeeds();
-      dispatch({ type: 'SET_ARTICLES', payload: allArticles });
       dispatch({ type: 'SET_FEEDS', payload: allFeeds });
+      dispatch({ type: 'BUMP_VERSION' });
+      // Enrich images async — articles already in DB, images fill in when ready
+      enrichWithImages(articles).then(async enriched => {
+        if (enriched.some(a => a.imageUrl)) {
+          await db.upsertArticles(enriched);
+          dispatch({ type: 'BUMP_VERSION' });
+        }
+      });
     } catch (e) {
       console.warn('Feed fetch error', feed.url, e);
     }
@@ -166,6 +147,32 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     await Promise.allSettled(state.feeds.map(refreshFeed));
     dispatch({ type: 'SET_REFRESHING', payload: false });
   }, [state.feeds, refreshFeed]);
+
+  const fetchOlderFromNetwork = useCallback(async (filter: FeedFilter, page: number): Promise<Article[]> => {
+    if (filter.type === 'bookmarks') return [];
+
+    let feedsToFetch: Feed[];
+    if (filter.type === 'feed') {
+      feedsToFetch = state.feeds.filter(f => f.id === filter.feedId);
+    } else if (filter.type === 'folder') {
+      feedsToFetch = state.feeds.filter(f => f.folderId === filter.folderId);
+    } else {
+      feedsToFetch = state.feeds;
+    }
+
+    const existingIds = await db.getAllArticleIds();
+    const results = await Promise.allSettled(
+      feedsToFetch.map(feed => fetchOlderArticles(feed, page, existingIds)),
+    );
+    const fresh: Article[] = [];
+    for (const r of results) {
+      if (r.status === 'fulfilled') fresh.push(...r.value);
+    }
+    if (fresh.length > 0) {
+      await db.upsertArticles(fresh);
+    }
+    return fresh;
+  }, [state.feeds]);
 
   const addFeed = useCallback(async (url: string, folderId?: string) => {
     const meta = await fetchFeedMeta(url);
@@ -188,21 +195,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const removeFeed = useCallback(async (feedId: string) => {
     await storage.deleteFeed(feedId);
-    const [feeds, articles] = await Promise.all([
-      storage.getFeeds(),
-      storage.getArticles(),
-    ]);
+    const feeds = await storage.getFeeds();
     dispatch({ type: 'SET_FEEDS', payload: feeds });
-    dispatch({ type: 'SET_ARTICLES', payload: articles });
+    dispatch({ type: 'BUMP_VERSION' });
   }, []);
 
   const moveFeed = useCallback(async (feedId: string, folderId?: string) => {
     const feed = state.feeds.find(f => f.id === feedId);
     if (!feed) return;
-    const updated = { ...feed, folderId };
-    await storage.saveFeed(updated);
+    await storage.saveFeed({ ...feed, folderId });
     const feeds = await storage.getFeeds();
     dispatch({ type: 'SET_FEEDS', payload: feeds });
+    dispatch({ type: 'BUMP_VERSION' });
   }, [state.feeds]);
 
   const addFolder = useCallback(async (name: string): Promise<Folder> => {
@@ -232,21 +236,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const markRead = useCallback(async (articleId: string) => {
-    await storage.markArticleRead(articleId, true);
-    const articles = await storage.getArticles();
-    dispatch({ type: 'SET_ARTICLES', payload: articles });
+    await db.markArticleRead(articleId, true);
   }, []);
 
   const markAllRead = useCallback(async (feedId: string) => {
-    await storage.markFeedAllRead(feedId);
-    const articles = await storage.getArticles();
-    dispatch({ type: 'SET_ARTICLES', payload: articles });
+    await db.markFeedAllRead(feedId);
+    dispatch({ type: 'BUMP_VERSION' });
   }, []);
 
-  const toggleBookmark = useCallback(async (articleId: string) => {
-    await storage.toggleBookmark(articleId);
-    const articles = await storage.getArticles();
-    dispatch({ type: 'SET_ARTICLES', payload: articles });
+  const toggleBookmark = useCallback(async (articleId: string): Promise<boolean> => {
+    const next = await db.toggleBookmark(articleId);
+    dispatch({ type: 'BUMP_VERSION' });
+    return next;
   }, []);
 
   const setFilter = useCallback((filter: FeedFilter) => {
@@ -273,7 +274,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const value: AppContextValue = {
     state,
-    filteredArticles,
     addFeed,
     removeFeed,
     moveFeed,
@@ -285,6 +285,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     toggleBookmark,
     refreshAll,
     refreshFeed,
+    fetchOlderFromNetwork,
     setFilter,
     updateSettings,
     importFeeds,

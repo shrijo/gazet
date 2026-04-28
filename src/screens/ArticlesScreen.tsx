@@ -2,15 +2,15 @@ import React, { useCallback, useRef, useEffect, useState } from 'react';
 import {
   View,
   FlatList,
-  Image,
   Animated,
   Easing,
   TouchableOpacity,
   StyleSheet,
   RefreshControl,
+  ActivityIndicator,
   useWindowDimensions,
 } from 'react-native';
-import { Video, ResizeMode } from 'expo-av';
+import { VideoView, useVideoPlayer } from 'expo-video';
 import { LinearGradient } from 'expo-linear-gradient';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -20,24 +20,122 @@ import { useSettingsDrawer } from '../navigation/SettingsDrawer';
 import { useTheme } from '../theme';
 import { Text, Icon, Card, Skeleton, Divider } from '../components';
 import { useAppStore } from '../hooks/useAppStore';
-import { Article, ViewMode } from '../types';
+import { queryArticles, QueryOptions } from '../services/db';
+import { Article, Feed, FeedFilter, ViewMode } from '../types';
 import { formatArticleDate } from '../utils/date';
 
 const BAR_HEIGHT = 64;
 const HEADER_HEIGHT = 56;
+const PAGE_SIZE = 30;
+
+function buildQueryOpts(
+  filter: FeedFilter,
+  feeds: Feed[],
+  hideRead: boolean,
+  offset: number,
+): QueryOptions {
+  const feedIds =
+    filter.type === 'feed'   ? [filter.feedId] :
+    filter.type === 'folder' ? feeds.filter(f => f.folderId === filter.folderId).map(f => f.id) :
+    undefined;
+
+  return {
+    feedIds,
+    bookmarksOnly: filter.type === 'bookmarks',
+    hideRead,
+    limit: PAGE_SIZE,
+    offset,
+  };
+}
 
 export function ArticlesScreen() {
   const { colors, spacing } = useTheme();
   const navigation = useNavigation();
   const drawer = useDrawer();
   const settingsDrawer = useSettingsDrawer();
-  const { state, filteredArticles, refreshAll, markRead, updateSettings, setFilter } =
-    useAppStore();
-  const { settings, filter, loading, refreshing } = state;
+  const {
+    state,
+    refreshAll,
+    fetchOlderFromNetwork,
+    markRead,
+    updateSettings,
+    setFilter,
+  } = useAppStore();
+  const { settings, filter, feeds, loading, refreshing, articleVersion } = state;
 
   const viewMode = settings.viewMode;
   const isCard = viewMode === 'card';
   const isReel = viewMode === 'reel';
+
+  // Local article list — screen owns pagination
+  const [articles, setArticles] = useState<Article[]>([]);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const loadingMoreRef = useRef(false);
+  const noMoreRef      = useRef(false);
+  const rssPageRef     = useRef(2);
+
+  const filterKey =
+    filter.type === 'feed'   ? `feed:${filter.feedId}` :
+    filter.type === 'folder' ? `folder:${filter.folderId}` :
+    filter.type;
+
+  // Reset and load first page whenever filter or read-hiding changes
+  useEffect(() => {
+    if (loading) return;
+    noMoreRef.current      = false;
+    loadingMoreRef.current = false;
+    rssPageRef.current     = 2;
+    setLoadingMore(false);
+    queryArticles(buildQueryOpts(filter, feeds, settings.hideReadArticles, 0))
+      .then(setArticles);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterKey, settings.hideReadArticles, loading]);
+
+  // On articleVersion bump (refresh / markAllRead / toggleBookmark):
+  // reload the same number of articles from offset 0 so the list stays in place.
+  const articleCountRef = useRef(0);
+  useEffect(() => { articleCountRef.current = articles.length; }, [articles.length]);
+
+  useEffect(() => {
+    if (loading || articleVersion === 0) return;
+    const count = Math.max(articleCountRef.current, PAGE_SIZE);
+    queryArticles({ ...buildQueryOpts(filter, feeds, settings.hideReadArticles, 0), limit: count })
+      .then(setArticles);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [articleVersion]);
+
+  const handleLoadMore = useCallback(async () => {
+    if (loadingMoreRef.current || noMoreRef.current) return;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    try {
+      // First: next page from local SQLite (fast, no network)
+      const fresh = await queryArticles(
+        buildQueryOpts(filter, feeds, settings.hideReadArticles, articles.length),
+      );
+      if (fresh.length > 0) {
+        setArticles(prev => [...prev, ...fresh]);
+        return;
+      }
+      // SQLite exhausted — try network (RSS URL pagination)
+      if (filter.type !== 'bookmarks') {
+        const fromNet = await fetchOlderFromNetwork(filter, rssPageRef.current);
+        rssPageRef.current++;
+        if (fromNet.length === 0) {
+          noMoreRef.current = true;
+          return;
+        }
+        // Sort by pub_date DESC to match the display order, then append
+        fromNet.sort((a, b) => b.pubDate - a.pubDate);
+        setArticles(prev => [...prev, ...fromNet]);
+      } else {
+        noMoreRef.current = true;
+      }
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+    }
+  }, [filter, feeds, settings.hideReadArticles, articles.length, fetchOlderFromNetwork]);
 
   const activeTab = React.useMemo(() => {
     if (filter.type === 'bookmarks') return 'bookmarks';
@@ -45,7 +143,7 @@ export function ArticlesScreen() {
   }, [filter]);
 
   const filterLabel = React.useMemo(() => {
-    if (filter.type === 'all') return 'All Articles';
+    if (filter.type === 'all')       return 'All Articles';
     if (filter.type === 'bookmarks') return 'Bookmarks';
     if (filter.type === 'feed') {
       return state.feeds.find(f => f.id === filter.feedId)?.title ?? 'Feed';
@@ -59,6 +157,9 @@ export function ArticlesScreen() {
   const handleArticlePress = useCallback(
     (article: Article) => {
       markRead(article.id);
+      setArticles(prev =>
+        prev.map(a => a.id === article.id ? { ...a, isRead: true } : a),
+      );
       (navigation as any).navigate('ArticleDetail', { article });
     },
     [markRead, navigation],
@@ -71,14 +172,14 @@ export function ArticlesScreen() {
 
   const renderCard = useCallback(
     ({ item }: { item: Article }) => (
-      <ArticleCard article={item} onPress={() => handleArticlePress(item)} />
+      <ArticleCard article={item} onPress={handleArticlePress} />
     ),
     [handleArticlePress],
   );
 
   const renderListItem = useCallback(
     ({ item }: { item: Article }) => (
-      <ArticleListItem article={item} onPress={() => handleArticlePress(item)} />
+      <ArticleListItem article={item} onPress={handleArticlePress} />
     ),
     [handleArticlePress],
   );
@@ -113,7 +214,7 @@ export function ArticlesScreen() {
       >
         <Header title={filterLabel} viewMode={viewMode} onCycleView={cycleViewMode} />
         <ReelList
-          articles={filteredArticles}
+          articles={articles}
           onPress={handleArticlePress}
           onRefresh={refreshAll}
           refreshing={refreshing}
@@ -136,7 +237,7 @@ export function ArticlesScreen() {
       <Header title={filterLabel} viewMode={viewMode} onCycleView={cycleViewMode} />
 
       <FlatList
-        data={filteredArticles}
+        data={articles}
         keyExtractor={a => a.id}
         renderItem={isCard ? renderCard : renderListItem}
         contentContainerStyle={
@@ -145,12 +246,21 @@ export function ArticlesScreen() {
             : { paddingTop: spacing[2] }
         }
         ItemSeparatorComponent={isCard ? undefined : () => <Divider inset={56} />}
+        onEndReached={articles.length > 0 ? handleLoadMore : undefined}
+        onEndReachedThreshold={0.5}
+        windowSize={5}
+        maxToRenderPerBatch={6}
+        initialNumToRender={6}
+        removeClippedSubviews
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
             onRefresh={refreshAll}
             tintColor={colors.accent}
           />
+        }
+        ListFooterComponent={
+          articles.length > 0 ? <EndFooter loading={loadingMore} /> : null
         }
         ListEmptyComponent={
           <View style={styles.empty}>
@@ -233,6 +343,10 @@ function ReelList({
       })}
       onViewableItemsChanged={onViewableItemsChanged}
       viewabilityConfig={viewabilityConfig.current}
+      windowSize={3}
+      maxToRenderPerBatch={2}
+      initialNumToRender={2}
+      removeClippedSubviews
       refreshControl={
         <RefreshControl
           refreshing={refreshing}
@@ -281,7 +395,6 @@ function ArticleReelItem({
     >
       <ReelMediaBackground article={article} isActive={isActive} />
 
-      {/* gradient scrim — transparent at top, dark at bottom */}
       <LinearGradient
         colors={['transparent', 'rgba(0,0,0,0.15)', 'rgba(0,0,0,0.82)']}
         locations={[0.35, 0.6, 1]}
@@ -289,7 +402,6 @@ function ArticleReelItem({
         pointerEvents="none"
       />
 
-      {/* bottom content */}
       <View style={[styles.reelContent, { padding: spacing[5] }]}>
         <View style={styles.reelMeta}>
           {!article.isRead && <View style={styles.unreadDotWhite} />}
@@ -332,7 +444,6 @@ function ArticleReelItem({
         ) : null}
       </View>
 
-      {/* swipe hint */}
       <View style={styles.reelSwipeHint} pointerEvents="none">
         <Icon name="chevron-up-outline" size={18} color="rgba(255,255,255,0.4)" />
       </View>
@@ -383,18 +494,29 @@ function ReelVideo({
   fallbackImageUri?: string;
   isActive: boolean;
 }) {
-  const videoRef = useRef<Video>(null);
   const [muted, setMuted] = useState(true);
   const [errored, setErrored] = useState(false);
 
+  const player = useVideoPlayer(uri, p => {
+    p.loop = true;
+    p.muted = true;
+  });
+
   useEffect(() => {
-    if (!videoRef.current) return;
-    if (isActive) {
-      videoRef.current.playAsync().catch(() => {});
-    } else {
-      videoRef.current.pauseAsync().catch(() => {});
-    }
-  }, [isActive]);
+    const sub = player.addListener('statusChange', ({ status }) => {
+      if (status === 'error') setErrored(true);
+    });
+    return () => sub.remove();
+  }, [player]);
+
+  useEffect(() => {
+    if (isActive) player.play();
+    else player.pause();
+  }, [isActive, player]);
+
+  useEffect(() => {
+    player.muted = muted;
+  }, [muted, player]);
 
   if (errored) {
     return fallbackImageUri
@@ -404,15 +526,11 @@ function ReelVideo({
 
   return (
     <>
-      <Video
-        ref={videoRef}
-        source={{ uri }}
+      <VideoView
+        player={player}
         style={StyleSheet.absoluteFill}
-        resizeMode={ResizeMode.COVER}
-        shouldPlay={isActive}
-        isLooping
-        isMuted={muted}
-        onError={() => setErrored(true)}
+        contentFit="cover"
+        nativeControls={false}
       />
       <TouchableOpacity
         onPress={() => setMuted(m => !m)}
@@ -435,7 +553,6 @@ function ReelVideo({
 // Ken Burns animated image
 // ---------------------------------------------------------------------------
 
-// Each article gets a deterministic pan direction so adjacent reels feel varied.
 const KB_DIRECTIONS = [
   { tx: -20, ty: -12 },
   { tx: 20,  ty: -10 },
@@ -445,9 +562,8 @@ const KB_DIRECTIONS = [
 
 function KenBurnsImage({ uri, isActive }: { uri: string; isActive: boolean }) {
   const progress = useRef(new Animated.Value(0)).current;
-  const animRef = useRef<Animated.CompositeAnimation | null>(null);
+  const animRef  = useRef<Animated.CompositeAnimation | null>(null);
 
-  // Pick a direction index from the URI string so it's stable per article.
   const dirIndex = uri.length % KB_DIRECTIONS.length;
   const { tx, ty } = KB_DIRECTIONS[dirIndex];
 
@@ -470,7 +586,7 @@ function KenBurnsImage({ uri, isActive }: { uri: string; isActive: boolean }) {
     return () => animRef.current?.stop();
   }, [isActive]);
 
-  const scale = progress.interpolate({ inputRange: [0, 1], outputRange: [1, 1.15] });
+  const scale      = progress.interpolate({ inputRange: [0, 1], outputRange: [1, 1.15] });
   const translateX = progress.interpolate({ inputRange: [0, 1], outputRange: [0, tx] });
   const translateY = progress.interpolate({ inputRange: [0, 1], outputRange: [0, ty] });
 
@@ -483,6 +599,19 @@ function KenBurnsImage({ uri, isActive }: { uri: string; isActive: boolean }) {
       ]}
       resizeMode="cover"
     />
+  );
+}
+
+// ---------------------------------------------------------------------------
+// End-of-list footer
+// ---------------------------------------------------------------------------
+
+function EndFooter({ loading }: { loading: boolean }) {
+  const { colors, spacing } = useTheme();
+  return (
+    <View style={{ height: spacing[12], alignItems: 'center', justifyContent: 'center' }}>
+      {loading && <ActivityIndicator color={colors.textTertiary} />}
+    </View>
   );
 }
 
@@ -541,7 +670,7 @@ function BarButton({
   return (
     <TouchableOpacity onPress={onPress} activeOpacity={0.5} style={styles.barBtn}>
       {icon ? (
-        <Icon name={icon} size={24} color={color} />
+        <Icon name={icon as any} size={24} color={color} />
       ) : (
         <Text
           variant="labelSm"
@@ -566,8 +695,8 @@ function Header({
   const { colors, spacing } = useTheme();
 
   const iconName =
-    viewMode === 'card'  ? 'list-outline'  :
-    viewMode === 'list'  ? 'film-outline'  :
+    viewMode === 'card' ? 'list-outline'  :
+    viewMode === 'list' ? 'film-outline'  :
     'grid-outline';
 
   return (
@@ -591,27 +720,46 @@ function Header({
 }
 
 // ---------------------------------------------------------------------------
-// Card / List item views (unchanged)
+// FadeImage — fixed-size placeholder that fades to the loaded image
 // ---------------------------------------------------------------------------
 
-function ArticleCard({
+const FadeImage = React.memo(function FadeImage({ uri, style }: { uri: string; style: any }) {
+  const { colors } = useTheme();
+  const opacity = useRef(new Animated.Value(0)).current;
+  const onLoad = useCallback(() => {
+    Animated.timing(opacity, { toValue: 1, duration: 250, useNativeDriver: true }).start();
+  }, [opacity]);
+  return (
+    <View style={[style, { backgroundColor: colors.skeleton, overflow: 'hidden' }]}>
+      <Animated.Image
+        source={{ uri }}
+        style={[StyleSheet.absoluteFill, { opacity }]}
+        resizeMode="cover"
+        onLoad={onLoad}
+      />
+    </View>
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Card / List item views
+// ---------------------------------------------------------------------------
+
+const ArticleCard = React.memo(function ArticleCard({
   article,
   onPress,
 }: {
   article: Article;
-  onPress: () => void;
+  onPress: (article: Article) => void;
 }) {
   const { colors, spacing } = useTheme();
+  const handlePress = useCallback(() => onPress(article), [onPress, article]);
 
   return (
-    <Card onPress={onPress} noPadding elevated>
-      {article.imageUrl && (
-        <Image
-          source={{ uri: article.imageUrl }}
-          style={styles.cardImage}
-          resizeMode="cover"
-        />
-      )}
+    <Card onPress={handlePress} noPadding elevated>
+      {article.imageUrl ? (
+        <FadeImage uri={article.imageUrl} style={styles.cardImage} />
+      ) : null}
       <View style={{ paddingTop: spacing[3], paddingRight: spacing[4], paddingBottom: spacing[4] }}>
         <View style={styles.cardMeta}>
           <Text variant="labelSm" color="tertiary">{article.feedTitle}</Text>
@@ -650,20 +798,21 @@ function ArticleCard({
       </View>
     </Card>
   );
-}
+});
 
-function ArticleListItem({
+const ArticleListItem = React.memo(function ArticleListItem({
   article,
   onPress,
 }: {
   article: Article;
-  onPress: () => void;
+  onPress: (article: Article) => void;
 }) {
   const { colors, spacing } = useTheme();
+  const handlePress = useCallback(() => onPress(article), [onPress, article]);
 
   return (
     <TouchableOpacity
-      onPress={onPress}
+      onPress={handlePress}
       activeOpacity={0.7}
       style={[
         styles.listItem,
@@ -671,13 +820,9 @@ function ArticleListItem({
       ]}
     >
       <View style={styles.listItemContent}>
-        {article.imageUrl && (
-          <Image
-            source={{ uri: article.imageUrl }}
-            style={styles.listItemThumb}
-            resizeMode="cover"
-          />
-        )}
+        {article.imageUrl ? (
+          <FadeImage uri={article.imageUrl} style={styles.listItemThumb} />
+        ) : null}
         <View style={{ flex: 1 }}>
           <View style={styles.listItemMeta}>
             {!article.isRead && (
@@ -710,7 +855,7 @@ function ArticleListItem({
       </View>
     </TouchableOpacity>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
 // Styles
@@ -781,7 +926,6 @@ const styles = StyleSheet.create({
     flexShrink: 0,
     marginRight: 12,
   },
-  // reel
   reelItem: {
     overflow: 'hidden',
   },

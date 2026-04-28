@@ -1,4 +1,4 @@
-import React, { useCallback } from 'react';
+import React, { useCallback, useState } from 'react';
 import {
   View,
   ScrollView,
@@ -40,8 +40,8 @@ export function ArticleDetailScreen() {
   const route = useRoute<RouteProp<RouteParams, 'ArticleDetail'>>();
   const { article } = route.params;
 
-  const { state, toggleBookmark } = useAppStore();
-  const liveArticle = state.articles.find(a => a.id === article.id) ?? article;
+  const { toggleBookmark } = useAppStore();
+  const [isBookmarked, setIsBookmarked] = useState(article.isBookmarked);
 
   const bodyText = article.content?.trim().length
     ? stripHtml(article.content)
@@ -49,7 +49,10 @@ export function ArticleDetailScreen() {
       ? stripHtml(article.summary)
       : null;
 
-  const handleBookmark = useCallback(() => toggleBookmark(article.id), [article.id, toggleBookmark]);
+  const handleBookmark = useCallback(async () => {
+    const next = await toggleBookmark(article.id);
+    setIsBookmarked(next);
+  }, [article.id, toggleBookmark]);
   const handleShare    = useCallback(() => Share.share({ title: article.title, url: article.link }), [article]);
   const handleOpen     = useCallback(() => Linking.openURL(article.link), [article.link]);
 
@@ -71,9 +74,9 @@ export function ArticleDetailScreen() {
         <View style={styles.toolbarRight}>
           <TouchableOpacity onPress={handleBookmark} hitSlop={8}>
             <Icon
-              name={liveArticle.isBookmarked ? 'bookmark' : 'bookmark-outline'}
+              name={isBookmarked ? 'bookmark' : 'bookmark-outline'}
               size={22}
-              color={liveArticle.isBookmarked ? 'primary' : 'secondary'}
+              color={isBookmarked ? 'primary' : 'secondary'}
             />
           </TouchableOpacity>
           <TouchableOpacity onPress={handleShare} hitSlop={8} style={{ marginLeft: spacing[4] }}>

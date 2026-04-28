@@ -1,10 +1,10 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Folder, Feed, Article, Settings } from '../types';
+import * as db from './db';
 
 const KEYS = {
-  FOLDERS: '@kern/folders',
-  FEEDS: '@kern/feeds',
-  ARTICLES: '@kern/articles',
+  FOLDERS:  '@kern/folders',
+  FEEDS:    '@kern/feeds',
   SETTINGS: '@kern/settings',
 } as const;
 
@@ -15,7 +15,37 @@ const DEFAULT_SETTINGS: Settings = {
   notificationsEnabled: false,
   markReadOnScroll: true,
   showImages: true,
+  showUnreadBadges: false,
+  hideReadArticles: false,
 };
+
+const MIGRATION_V4 = '@kern/migration_v4';
+const MIGRATION_V5 = '@kern/migration_v5';
+
+export async function runMigrations(): Promise<void> {
+  // v4: move AsyncStorage articles → SQLite
+  if (!await AsyncStorage.getItem(MIGRATION_V4)) {
+    const raw = await AsyncStorage.getItem('@kern/articles');
+    if (raw) {
+      const articles: Article[] = JSON.parse(raw);
+      const fixed = articles.map(a => {
+        if (!a.imageUrl) return a;
+        if (a.imageUrl.startsWith('http')) return a;
+        return { ...a, imageUrl: undefined };
+      });
+      await db.upsertArticles(fixed);
+      await AsyncStorage.removeItem('@kern/articles');
+    }
+    await AsyncStorage.setItem(MIGRATION_V4, '1');
+  }
+
+  // v5: clear articles that were stored with old 32-bit hash IDs to prevent
+  // duplicate-key collisions after upgrading to 53-bit cyrb53 IDs.
+  if (!await AsyncStorage.getItem(MIGRATION_V5)) {
+    db.clearArticles();
+    await AsyncStorage.setItem(MIGRATION_V5, '1');
+  }
+}
 
 // --- Generic helpers ---
 
@@ -45,10 +75,7 @@ export async function saveFolder(folder: Folder): Promise<void> {
 
 export async function deleteFolder(folderId: string): Promise<void> {
   const folders = await getFolders();
-  await setJson(
-    KEYS.FOLDERS,
-    folders.filter(f => f.id !== folderId),
-  );
+  await setJson(KEYS.FOLDERS, folders.filter(f => f.id !== folderId));
   // Move feeds in folder to root
   const feeds = await getFeeds();
   const updated = feeds.map(f =>
@@ -73,71 +100,8 @@ export async function saveFeed(feed: Feed): Promise<void> {
 
 export async function deleteFeed(feedId: string): Promise<void> {
   const feeds = await getFeeds();
-  await setJson(
-    KEYS.FEEDS,
-    feeds.filter(f => f.id !== feedId),
-  );
-  // Remove articles for this feed
-  const articles = await getArticles();
-  await setJson(
-    KEYS.ARTICLES,
-    articles.filter(a => a.feedId !== feedId),
-  );
-}
-
-// --- Articles ---
-
-export async function getArticles(): Promise<Article[]> {
-  return getJson<Article[]>(KEYS.ARTICLES, []);
-}
-
-export async function upsertArticles(incoming: Article[]): Promise<void> {
-  const existing = await getArticles();
-  const map = new Map(existing.map(a => [a.id, a]));
-  for (const article of incoming) {
-    const prev = map.get(article.id);
-    if (prev) {
-      // Preserve user state
-      map.set(article.id, {
-        ...article,
-        isRead: prev.isRead,
-        isBookmarked: prev.isBookmarked,
-      });
-    } else {
-      map.set(article.id, article);
-    }
-  }
-  await setJson(KEYS.ARTICLES, Array.from(map.values()));
-}
-
-export async function markArticleRead(articleId: string, isRead: boolean): Promise<void> {
-  const articles = await getArticles();
-  const updated = articles.map(a =>
-    a.id === articleId ? { ...a, isRead } : a,
-  );
-  await setJson(KEYS.ARTICLES, updated);
-}
-
-export async function markFeedAllRead(feedId: string): Promise<void> {
-  const articles = await getArticles();
-  const updated = articles.map(a =>
-    a.feedId === feedId ? { ...a, isRead: true } : a,
-  );
-  await setJson(KEYS.ARTICLES, updated);
-}
-
-export async function toggleBookmark(articleId: string): Promise<boolean> {
-  const articles = await getArticles();
-  let next = false;
-  const updated = articles.map(a => {
-    if (a.id === articleId) {
-      next = !a.isBookmarked;
-      return { ...a, isBookmarked: next };
-    }
-    return a;
-  });
-  await setJson(KEYS.ARTICLES, updated);
-  return next;
+  await setJson(KEYS.FEEDS, feeds.filter(f => f.id !== feedId));
+  await db.deleteArticlesByFeed(feedId);
 }
 
 // --- Settings ---
