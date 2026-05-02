@@ -162,12 +162,25 @@ async function fetchOgImage(url: string): Promise<string | undefined> {
   }
 }
 
+// A real-browser-style User-Agent unblocks feeds behind Cloudflare/anti-bot
+// protections that reject the default fetch UA.
+const FETCH_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+  Accept:
+    'application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.5',
+  'Accept-Language': 'en-US,en;q=0.5',
+};
+
 async function fetchXml(url: string): Promise<any> {
-  const res = await fetch(url, {
-    headers: { Accept: 'application/rss+xml, application/atom+xml, text/xml, */*' },
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const res = await fetch(url, { headers: FETCH_HEADERS });
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
   const text = await res.text();
+  // Some hosts return HTML error pages with a 200 status. Sanity-check that
+  // we got XML before handing it to the parser.
+  if (!/<\?xml|<rss|<feed|<rdf:RDF/i.test(text.slice(0, 800))) {
+    throw new Error(`Not an XML feed: ${url}`);
+  }
   return parser.parse(text);
 }
 
@@ -183,45 +196,139 @@ async function enrichWithImages(articles: Article[]): Promise<Article[]> {
 }
 
 function paginatedUrls(baseUrl: string, page: number): string[] {
+  const urls = new Set<string>();
   try {
-    const urls: string[] = [];
-    // WordPress standard paging
+    // ?paged=N (WordPress)
     const u1 = new URL(baseUrl);
     u1.searchParams.set('paged', String(page));
-    urls.push(u1.toString());
-    // Generic ?page=N
+    urls.add(u1.toString());
+    // ?page=N (generic)
     const u2 = new URL(baseUrl);
     u2.searchParams.set('page', String(page));
-    urls.push(u2.toString());
-    return urls;
+    urls.add(u2.toString());
+    // /page/N/ inserted before /feed (WordPress permalink)
+    const u3 = new URL(baseUrl);
+    if (/\/feed\/?$/i.test(u3.pathname)) {
+      u3.pathname = u3.pathname.replace(/\/feed\/?$/i, `/page/${page}/feed/`);
+      urls.add(u3.toString());
+    } else {
+      // Append /page/N/ at the end of the path
+      const u4 = new URL(baseUrl);
+      u4.pathname = u4.pathname.replace(/\/?$/, `/page/${page}/`);
+      urls.add(u4.toString());
+    }
+  } catch { /* ignore */ }
+  return [...urls];
+}
+
+function parseDoc(doc: any, feed: Feed, now: number): Article[] {
+  if (doc?.rss?.channel)   return (doc.rss.channel.item ?? []).map((i: any) => parseRssItem(i, feed, now));
+  if (doc?.feed?.entry)    return (doc.feed.entry ?? []).map((e: any) => parseAtomEntry(e, feed, now));
+  if (doc?.['rdf:RDF'])    return (doc['rdf:RDF'].item ?? []).map((i: any) => parseRssItem(i, feed, now));
+  return [];
+}
+
+// ---------------------------------------------------------------------------
+// Pagination cursor — a state machine the screen threads back and forth so
+// each "load more" tap advances through strategies without losing context.
+// ---------------------------------------------------------------------------
+
+export type PageCursor =
+  | { kind: 'urlPage'; page: number }                                 // try /page/N variants
+  | { kind: 'wbInit' }                                                // need to fetch the wayback timemap
+  | { kind: 'wb'; snapshots: string[]; index: number }                // iterating wayback snapshots
+  | { kind: 'done' };
+
+export const initialPageCursor: PageCursor = { kind: 'urlPage', page: 2 };
+
+interface PageResult {
+  articles: Article[];
+  cursor: PageCursor;
+}
+
+// Fetch the next batch of older articles for a single feed using the cursor.
+// Returns an empty array + cursor 'done' when no further history is reachable.
+export async function fetchOlderPage(
+  feed: Feed,
+  cursor: PageCursor,
+  existingIds: Set<string>,
+): Promise<PageResult> {
+  const now = Date.now();
+
+  if (cursor.kind === 'urlPage') {
+    for (const url of paginatedUrls(feed.url, cursor.page)) {
+      try {
+        const doc = await fetchXml(url);
+        const fresh = parseDoc(doc, feed, now).filter(a => !existingIds.has(a.id));
+        if (fresh.length > 0) {
+          return { articles: fresh, cursor: { kind: 'urlPage', page: cursor.page + 1 } };
+        }
+      } catch { /* try next variant */ }
+    }
+    // URL pagination exhausted for this feed — try the Wayback Machine next.
+    return fetchOlderPage(feed, { kind: 'wbInit' }, existingIds);
+  }
+
+  if (cursor.kind === 'wbInit') {
+    const snapshots = await fetchWaybackSnapshots(feed.url);
+    if (snapshots.length === 0) return { articles: [], cursor: { kind: 'done' } };
+    return fetchOlderPage(feed, { kind: 'wb', snapshots, index: 0 }, existingIds);
+  }
+
+  if (cursor.kind === 'wb') {
+    const { snapshots, index } = cursor;
+    if (index >= snapshots.length) return { articles: [], cursor: { kind: 'done' } };
+    try {
+      const doc = await fetchXml(snapshots[index]);
+      const fresh = parseDoc(doc, feed, now).filter(a => !existingIds.has(a.id));
+      const next: PageCursor = { kind: 'wb', snapshots, index: index + 1 };
+      if (fresh.length > 0) return { articles: fresh, cursor: next };
+      // Empty snapshot — recurse to try the next one without spinning the UI.
+      return fetchOlderPage(feed, next, existingIds);
+    } catch {
+      return fetchOlderPage(feed, { kind: 'wb', snapshots, index: index + 1 }, existingIds);
+    }
+  }
+
+  return { articles: [], cursor: { kind: 'done' } };
+}
+
+// Internet Archive CDX API — newest snapshots first, deduped by digest so we
+// don't waste round-trips on identical snapshots. Returns a list of
+// "raw" snapshot URLs (the `id_` flag avoids WBM's HTML toolbar injection so
+// we get the original RSS/Atom content back).
+async function fetchWaybackSnapshots(feedUrl: string): Promise<string[]> {
+  try {
+    const cdxUrl =
+      `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(feedUrl)}` +
+      `&output=json&limit=80&filter=statuscode:200&collapse=digest`;
+    const res = await fetch(cdxUrl, { headers: FETCH_HEADERS });
+    if (!res.ok) return [];
+    const rows = (await res.json()) as string[][];
+    if (!Array.isArray(rows) || rows.length < 2) return [];
+    // First row is the column header.
+    const header = rows[0];
+    const tsIdx       = header.indexOf('timestamp');
+    const originalIdx = header.indexOf('original');
+    if (tsIdx < 0 || originalIdx < 0) return [];
+
+    return rows
+      .slice(1)
+      .map(r => `https://web.archive.org/web/${r[tsIdx]}id_/${r[originalIdx]}`)
+      .reverse(); // newest snapshots first
   } catch {
     return [];
   }
 }
 
-// Returns new articles without images — caller enriches images async after dispatch
+// Backwards-compatible wrapper used by the older call site (deprecated path).
 export async function fetchOlderArticles(
   feed: Feed,
   page: number,
   existingIds: Set<string>,
 ): Promise<Article[]> {
-  const now = Date.now();
-
-  for (const url of paginatedUrls(feed.url, page)) {
-    try {
-      const doc = await fetchXml(url);
-      let articles: Article[] = [];
-      if (doc?.rss?.channel) {
-        articles = (doc.rss.channel.item ?? []).map((i: any) => parseRssItem(i, feed, now));
-      } else if (doc?.feed?.entry) {
-        articles = (doc.feed.entry ?? []).map((e: any) => parseAtomEntry(e, feed, now));
-      }
-      const fresh = articles.filter(a => !existingIds.has(a.id));
-      if (fresh.length > 0) return fresh;
-    } catch { /* try next variant */ }
-  }
-
-  return [];
+  const { articles } = await fetchOlderPage(feed, { kind: 'urlPage', page }, existingIds);
+  return articles;
 }
 
 export { enrichWithImages };
@@ -279,7 +386,6 @@ function parseRssItem(item: any, feed: Feed, now: number): Article {
   const pubDate = item.pubDate ? new Date(getText(item.pubDate)).getTime() : now;
   const rawContent = getText(item['content:encoded']) || getText(item.content) || '';
   const rawSummary = getText(item.description) || rawContent;
-
   return {
     id,
     feedId: feed.id,

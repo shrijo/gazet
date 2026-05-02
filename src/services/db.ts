@@ -81,7 +81,11 @@ export interface QueryOptions {
   bookmarksOnly?: boolean;
   hideRead?: boolean;
   limit: number;
-  offset: number;
+  // Either offset OR cursor; cursor wins if both are set.
+  // Cursor pagination is stable when rows get filtered out mid-scroll
+  // (e.g. articles being marked read while hideRead is on).
+  offset?: number;
+  cursor?: { pubDate: number; id: string };
 }
 
 export async function queryArticles(opts: QueryOptions): Promise<Article[]> {
@@ -97,13 +101,24 @@ export async function queryArticles(opts: QueryOptions): Promise<Article[]> {
     params.push(...opts.feedIds);
   }
 
-  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-  params.push(opts.limit, opts.offset);
+  if (opts.cursor) {
+    // Strictly older than the cursor row in (pub_date DESC, id DESC) order
+    conditions.push('(pub_date < ? OR (pub_date = ? AND id < ?))');
+    params.push(opts.cursor.pubDate, opts.cursor.pubDate, opts.cursor.id);
+  }
 
-  const rows = await db.getAllAsync(
-    `SELECT * FROM articles ${where} ORDER BY pub_date DESC LIMIT ? OFFSET ?`,
-    params,
-  ) as any[];
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  let sql: string;
+  if (opts.cursor) {
+    params.push(opts.limit);
+    sql = `SELECT * FROM articles ${where} ORDER BY pub_date DESC, id DESC LIMIT ?`;
+  } else {
+    params.push(opts.limit, opts.offset ?? 0);
+    sql = `SELECT * FROM articles ${where} ORDER BY pub_date DESC, id DESC LIMIT ? OFFSET ?`;
+  }
+
+  const rows = await db.getAllAsync(sql, params) as any[];
   return rows.map(rowToArticle);
 }
 

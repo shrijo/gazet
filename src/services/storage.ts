@@ -73,6 +73,11 @@ export async function saveFolder(folder: Folder): Promise<void> {
   await setJson(KEYS.FOLDERS, folders);
 }
 
+/** Replace the entire ordered folder list (used for drag-to-reorder). */
+export async function saveFolders(folders: Folder[]): Promise<void> {
+  await setJson(KEYS.FOLDERS, folders);
+}
+
 export async function deleteFolder(folderId: string): Promise<void> {
   const folders = await getFolders();
   await setJson(KEYS.FOLDERS, folders.filter(f => f.id !== folderId));
@@ -95,6 +100,11 @@ export async function saveFeed(feed: Feed): Promise<void> {
   const idx = feeds.findIndex(f => f.id === feed.id);
   if (idx >= 0) feeds[idx] = feed;
   else feeds.push(feed);
+  await setJson(KEYS.FEEDS, feeds);
+}
+
+/** Replace the entire ordered feed list (used for drag-to-reorder). */
+export async function saveFeeds(feeds: Feed[]): Promise<void> {
   await setJson(KEYS.FEEDS, feeds);
 }
 

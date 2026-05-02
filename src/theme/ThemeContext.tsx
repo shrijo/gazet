@@ -27,13 +27,21 @@ const ThemeContext = createContext<ThemeContextValue | null>(null);
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const systemScheme = useColorScheme();
   const [mode, setMode] = useState<ThemeMode>('system');
+  // Hold the first render until we've checked AsyncStorage for a saved theme.
+  // Otherwise children (e.g. the splash) would briefly render in the default
+  // 'system' theme before snapping to the user's saved preference.
+  const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     AsyncStorage.getItem('@kern/settings').then(raw => {
-      if (!raw) return;
-      const saved = JSON.parse(raw);
-      if (saved?.themeMode) setMode(saved.themeMode);
-    }).catch(() => {});
+      if (raw) {
+        try {
+          const saved = JSON.parse(raw);
+          if (saved?.themeMode) setMode(saved.themeMode);
+        } catch {}
+      }
+      setLoaded(true);
+    }).catch(() => setLoaded(true));
   }, []);
 
   const resolvedScheme: ColorScheme =
@@ -57,7 +65,11 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     setMode,
   };
 
-  return <ThemeContext.Provider value={theme}>{children}</ThemeContext.Provider>;
+  return (
+    <ThemeContext.Provider value={theme}>
+      {loaded ? children : null}
+    </ThemeContext.Provider>
+  );
 }
 
 export function useTheme(): ThemeContextValue {

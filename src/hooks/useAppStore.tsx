@@ -8,7 +8,13 @@ import React, {
 import { Folder, Feed, Settings, FeedFilter, Article } from '../types';
 import * as storage from '../services/storage';
 import * as db from '../services/db';
-import { fetchArticles, fetchFeedMeta, fetchOlderArticles, enrichWithImages } from '../services/rss';
+import {
+  fetchArticles,
+  fetchFeedMeta,
+  fetchOlderPage,
+  enrichWithImages,
+  PageCursor,
+} from '../services/rss';
 import { generateId, uuid } from '../utils/id';
 
 interface AppState {
@@ -78,13 +84,15 @@ function reducer(state: AppState, action: Action): AppState {
 interface AppContextValue {
   state: AppState;
   // Feeds
-  addFeed:    (url: string, folderId?: string) => Promise<void>;
-  removeFeed: (feedId: string) => Promise<void>;
-  moveFeed:   (feedId: string, folderId?: string) => Promise<void>;
+  addFeed:       (url: string, folderId?: string) => Promise<void>;
+  removeFeed:    (feedId: string) => Promise<void>;
+  moveFeed:      (feedId: string, folderId?: string) => Promise<void>;
+  reorderFeeds:  (feeds: Feed[]) => Promise<void>;
   // Folders
-  addFolder:    (name: string) => Promise<Folder>;
-  renameFolder: (folderId: string, name: string) => Promise<void>;
-  removeFolder: (folderId: string) => Promise<void>;
+  addFolder:     (name: string) => Promise<Folder>;
+  updateFolder:  (folderId: string, patch: Partial<Folder>) => Promise<void>;
+  removeFolder:  (folderId: string) => Promise<void>;
+  reorderFolders:(folders: Folder[]) => Promise<void>;
   // Articles
   markRead:    (articleId: string) => Promise<void>;
   markAllRead: (feedId: string) => Promise<void>;
@@ -92,7 +100,12 @@ interface AppContextValue {
   // Refresh
   refreshAll:  () => Promise<void>;
   refreshFeed: (feed: Feed) => Promise<void>;
-  fetchOlderFromNetwork: (filter: FeedFilter, page: number) => Promise<Article[]>;
+  // Per-feed cursors threaded by the screen so each "load more" advances the
+  // pagination state machine (URL-page → Wayback Machine → done).
+  fetchOlderFromNetwork: (
+    filter: FeedFilter,
+    cursors: Record<string, PageCursor>,
+  ) => Promise<{ articles: Article[]; cursors: Record<string, PageCursor>; allDone: boolean }>;
   // Filter
   setFilter: (filter: FeedFilter) => void;
   // Settings
@@ -148,8 +161,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     dispatch({ type: 'SET_REFRESHING', payload: false });
   }, [state.feeds, refreshFeed]);
 
-  const fetchOlderFromNetwork = useCallback(async (filter: FeedFilter, page: number): Promise<Article[]> => {
-    if (filter.type === 'bookmarks') return [];
+  const fetchOlderFromNetwork = useCallback(async (
+    filter: FeedFilter,
+    cursors: Record<string, PageCursor>,
+  ): Promise<{ articles: Article[]; cursors: Record<string, PageCursor>; allDone: boolean }> => {
+    if (filter.type === 'bookmarks') {
+      return { articles: [], cursors, allDone: true };
+    }
 
     let feedsToFetch: Feed[];
     if (filter.type === 'feed') {
@@ -161,9 +179,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
 
     const existingIds = await db.getAllArticleIds();
+    const nextCursors: Record<string, PageCursor> = { ...cursors };
+
     const results = await Promise.allSettled(
-      feedsToFetch.map(feed => fetchOlderArticles(feed, page, existingIds)),
+      feedsToFetch
+        .filter(f => (cursors[f.id]?.kind ?? 'urlPage') !== 'done')
+        .map(async feed => {
+          const cur = cursors[feed.id] ?? ({ kind: 'urlPage', page: 2 } as PageCursor);
+          const { articles, cursor } = await fetchOlderPage(feed, cur, existingIds);
+          nextCursors[feed.id] = cursor;
+          return articles;
+        }),
     );
+
     const fresh: Article[] = [];
     for (const r of results) {
       if (r.status === 'fulfilled') fresh.push(...r.value);
@@ -171,7 +199,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (fresh.length > 0) {
       await db.upsertArticles(fresh);
     }
-    return fresh;
+
+    const allDone = feedsToFetch.every(f => (nextCursors[f.id]?.kind ?? 'urlPage') === 'done');
+    return { articles: fresh, cursors: nextCursors, allDone };
   }, [state.feeds]);
 
   const addFeed = useCallback(async (url: string, folderId?: string) => {
@@ -209,6 +239,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     dispatch({ type: 'BUMP_VERSION' });
   }, [state.feeds]);
 
+  const reorderFolders = useCallback(async (reordered: Folder[]) => {
+    await storage.saveFolders(reordered);
+    dispatch({ type: 'SET_FOLDERS', payload: reordered });
+  }, []);
+
+  const reorderFeeds = useCallback(async (reordered: Feed[]) => {
+    await storage.saveFeeds(reordered);
+    dispatch({ type: 'SET_FEEDS', payload: reordered });
+  }, []);
+
   const addFolder = useCallback(async (name: string): Promise<Folder> => {
     const folder: Folder = { id: uuid(), name, createdAt: Date.now() };
     await storage.saveFolder(folder);
@@ -217,10 +257,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return folder;
   }, []);
 
-  const renameFolder = useCallback(async (folderId: string, name: string) => {
+  const updateFolder = useCallback(async (folderId: string, patch: Partial<Folder>) => {
     const folder = state.folders.find(f => f.id === folderId);
     if (!folder) return;
-    await storage.saveFolder({ ...folder, name });
+    await storage.saveFolder({ ...folder, ...patch, id: folder.id });
     const folders = await storage.getFolders();
     dispatch({ type: 'SET_FOLDERS', payload: folders });
   }, [state.folders]);
@@ -277,9 +317,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     addFeed,
     removeFeed,
     moveFeed,
+    reorderFeeds,
     addFolder,
-    renameFolder,
+    updateFolder,
     removeFolder,
+    reorderFolders,
     markRead,
     markAllRead,
     toggleBookmark,
