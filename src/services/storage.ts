@@ -21,6 +21,7 @@ const DEFAULT_SETTINGS: Settings = {
 
 const MIGRATION_V4 = '@kern/migration_v4';
 const MIGRATION_V5 = '@kern/migration_v5';
+const MIGRATION_V6 = '@kern/migration_v6';
 
 export async function runMigrations(): Promise<void> {
   // v4: move AsyncStorage articles → SQLite
@@ -44,6 +45,12 @@ export async function runMigrations(): Promise<void> {
   if (!await AsyncStorage.getItem(MIGRATION_V5)) {
     db.clearArticles();
     await AsyncStorage.setItem(MIGRATION_V5, '1');
+  }
+
+  // v6: decode HTML entities (e.g. &#8217;) in stored article titles/summaries
+  if (!await AsyncStorage.getItem(MIGRATION_V6)) {
+    await db.fixStoredEntities();
+    await AsyncStorage.setItem(MIGRATION_V6, '1');
   }
 }
 
@@ -73,6 +80,11 @@ export async function saveFolder(folder: Folder): Promise<void> {
   await setJson(KEYS.FOLDERS, folders);
 }
 
+/** Replace the entire ordered folder list (used for drag-to-reorder). */
+export async function saveFolders(folders: Folder[]): Promise<void> {
+  await setJson(KEYS.FOLDERS, folders);
+}
+
 export async function deleteFolder(folderId: string): Promise<void> {
   const folders = await getFolders();
   await setJson(KEYS.FOLDERS, folders.filter(f => f.id !== folderId));
@@ -95,6 +107,11 @@ export async function saveFeed(feed: Feed): Promise<void> {
   const idx = feeds.findIndex(f => f.id === feed.id);
   if (idx >= 0) feeds[idx] = feed;
   else feeds.push(feed);
+  await setJson(KEYS.FEEDS, feeds);
+}
+
+/** Replace the entire ordered feed list (used for drag-to-reorder). */
+export async function saveFeeds(feeds: Feed[]): Promise<void> {
   await setJson(KEYS.FEEDS, feeds);
 }
 

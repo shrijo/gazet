@@ -10,6 +10,9 @@ import {
   ActivityIndicator,
   useWindowDimensions,
 } from 'react-native';
+import { Image as ExpoImage } from 'expo-image';
+
+const AnimatedExpoImage = Animated.createAnimatedComponent(ExpoImage);
 import { VideoView, useVideoPlayer } from 'expo-video';
 import { LinearGradient } from 'expo-linear-gradient';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -18,9 +21,10 @@ import { useNavigation } from '@react-navigation/native';
 import { useDrawer } from '../navigation/Drawer';
 import { useSettingsDrawer } from '../navigation/SettingsDrawer';
 import { useTheme } from '../theme';
-import { Text, Icon, Card, Skeleton, Divider } from '../components';
+import { Text, Icon, Card, Divider } from '../components';
 import { useAppStore } from '../hooks/useAppStore';
 import { queryArticles, QueryOptions } from '../services/db';
+import type { PageCursor } from '../services/rss';
 import { Article, Feed, FeedFilter, ViewMode } from '../types';
 import { formatArticleDate } from '../utils/date';
 
@@ -72,7 +76,48 @@ export function ArticlesScreen() {
   const [loadingMore, setLoadingMore] = useState(false);
   const loadingMoreRef = useRef(false);
   const noMoreRef      = useRef(false);
-  const rssPageRef     = useRef(2);
+  // Per-feed pagination cursors (URL-page → Wayback Machine → done).
+  const cursorsRef     = useRef<Record<string, PageCursor>>({});
+
+  // ---- Scroll-position preservation across view-mode switches ----
+  // Always-current snapshot of `articles` for use inside callbacks/effects.
+  const articlesRef = useRef<Article[]>([]);
+  useEffect(() => { articlesRef.current = articles; }, [articles]);
+  // ID of the topmost visible article — updated by all three views.
+  const visibleArticleIdRef = useRef<string | null>(null);
+  // Ref to the card/list FlatList so we can scroll it after a mode switch.
+  const flatListRef = useRef<FlatList<Article>>(null);
+  // Initial reel index: computed before the mode switch so the FlatList
+  // already has the right value when it first renders.
+  const [reelInitialIndex, setReelInitialIndex] = useState(0);
+
+  // Viewability config + handler shared by the card and list FlatList.
+  const listViewabilityConfig = useRef({ itemVisiblePercentThreshold: 30 });
+  const onListViewableItemsChanged = useCallback(({ viewableItems }: any) => {
+    if (viewableItems.length > 0) {
+      visibleArticleIdRef.current = viewableItems[0].item.id;
+    }
+  }, []);
+
+  // After a mode switch to card/list, restore scroll position.
+  // Reel uses initialScrollIndex (set synchronously in cycleViewMode).
+  useEffect(() => {
+    if (isReel) return;
+    const targetId = visibleArticleIdRef.current;
+    if (!targetId) return;
+    const idx = articlesRef.current.findIndex(a => a.id === targetId);
+    if (idx <= 0) return; // already at top
+    // Small delay so the FlatList completes its layout pass before we scroll.
+    const t = setTimeout(() => {
+      flatListRef.current?.scrollToIndex({
+        index: idx,
+        animated: false,
+        viewPosition: 0,
+      });
+    }, 80);
+    return () => clearTimeout(t);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewMode]);
 
   const filterKey =
     filter.type === 'feed'   ? `feed:${filter.feedId}` :
@@ -84,7 +129,7 @@ export function ArticlesScreen() {
     if (loading) return;
     noMoreRef.current      = false;
     loadingMoreRef.current = false;
-    rssPageRef.current     = 2;
+    cursorsRef.current     = {};
     setLoadingMore(false);
     queryArticles(buildQueryOpts(filter, feeds, settings.hideReadArticles, 0))
       .then(setArticles);
@@ -98,44 +143,65 @@ export function ArticlesScreen() {
 
   useEffect(() => {
     if (loading || articleVersion === 0) return;
+    // A refresh may have brought in new articles — allow pagination to retry
+    noMoreRef.current = false;
     const count = Math.max(articleCountRef.current, PAGE_SIZE);
     queryArticles({ ...buildQueryOpts(filter, feeds, settings.hideReadArticles, 0), limit: count })
       .then(setArticles);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [articleVersion]);
 
-  const handleLoadMore = useCallback(async () => {
+  const doLoadMore = useCallback(async (withSpinner: boolean) => {
     if (loadingMoreRef.current || noMoreRef.current) return;
     loadingMoreRef.current = true;
-    setLoadingMore(true);
+    if (withSpinner) setLoadingMore(true);
     try {
-      // First: next page from local SQLite (fast, no network)
-      const fresh = await queryArticles(
-        buildQueryOpts(filter, feeds, settings.hideReadArticles, articles.length),
-      );
+      // First: next page from local SQLite via cursor pagination so the offset
+      // doesn't drift when articles get marked read during scrolling.
+      const last = articles[articles.length - 1];
+      const fresh = await queryArticles({
+        ...buildQueryOpts(filter, feeds, settings.hideReadArticles, 0),
+        cursor: last ? { pubDate: last.pubDate, id: last.id } : undefined,
+      });
       if (fresh.length > 0) {
         setArticles(prev => [...prev, ...fresh]);
         return;
       }
-      // SQLite exhausted — try network (RSS URL pagination)
+      // SQLite exhausted — try the network (URL pagination, then Wayback Machine).
       if (filter.type !== 'bookmarks') {
-        const fromNet = await fetchOlderFromNetwork(filter, rssPageRef.current);
-        rssPageRef.current++;
-        if (fromNet.length === 0) {
+        const { articles: fromNet, cursors, allDone } =
+          await fetchOlderFromNetwork(filter, cursorsRef.current);
+        cursorsRef.current = cursors;
+        if (allDone && fromNet.length === 0) {
           noMoreRef.current = true;
           return;
         }
-        // Sort by pub_date DESC to match the display order, then append
-        fromNet.sort((a, b) => b.pubDate - a.pubDate);
-        setArticles(prev => [...prev, ...fromNet]);
+        if (fromNet.length === 0) {
+          // Some cursors advanced but the snapshot we hit was empty/duplicate;
+          // let the user tap again to advance further (no infinite loop here
+          // because each call moves the cursor forward).
+          return;
+        }
+        // Re-query from SQLite so cursor pagination naturally orders things by
+        // pub_date and we don't have to merge/sort in memory.
+        const last = articles[articles.length - 1];
+        const merged = await queryArticles({
+          ...buildQueryOpts(filter, feeds, settings.hideReadArticles, 0),
+          cursor: last ? { pubDate: last.pubDate, id: last.id } : undefined,
+          limit: PAGE_SIZE * 2,
+        });
+        if (merged.length > 0) setArticles(prev => [...prev, ...merged]);
       } else {
         noMoreRef.current = true;
       }
     } finally {
       loadingMoreRef.current = false;
-      setLoadingMore(false);
+      if (withSpinner) setLoadingMore(false);
     }
-  }, [filter, feeds, settings.hideReadArticles, articles.length, fetchOlderFromNetwork]);
+  }, [filter, feeds, settings.hideReadArticles, articles, fetchOlderFromNetwork]);
+
+  const handleLoadMore = useCallback(() => doLoadMore(true), [doLoadMore]);
+  const handleLoadMoreSilent = useCallback(() => doLoadMore(false), [doLoadMore]);
 
   const activeTab = React.useMemo(() => {
     if (filter.type === 'bookmarks') return 'bookmarks';
@@ -167,6 +233,13 @@ export function ArticlesScreen() {
 
   const cycleViewMode = useCallback(() => {
     const next: ViewMode = viewMode === 'card' ? 'list' : viewMode === 'list' ? 'reel' : 'card';
+    // If we're about to enter reel mode, pre-compute the initial scroll index
+    // so the FlatList receives it on first render (before the mode state lands).
+    if (next === 'reel') {
+      const targetId = visibleArticleIdRef.current;
+      const idx = targetId ? articlesRef.current.findIndex(a => a.id === targetId) : -1;
+      setReelInitialIndex(Math.max(0, idx));
+    }
     updateSettings({ viewMode: next });
   }, [viewMode, updateSettings]);
 
@@ -184,28 +257,6 @@ export function ArticlesScreen() {
     [handleArticlePress],
   );
 
-  if (loading) {
-    return (
-      <SafeAreaView
-        style={[styles.container, { backgroundColor: colors.background }]}
-        edges={['top']}
-      >
-        <Header title={filterLabel} viewMode={viewMode} onCycleView={cycleViewMode} />
-        <View style={{ padding: spacing[4], gap: spacing[3] }}>
-          {Array.from({ length: 4 }).map((_, i) => (
-            <Skeleton key={i} height={isCard ? 220 : 72} />
-          ))}
-        </View>
-        <BottomBar
-          activeTab={activeTab}
-          onMenu={drawer.open}
-          onFeed={() => setFilter({ type: 'all' })}
-          onSettings={() => settingsDrawer.open()}
-        />
-      </SafeAreaView>
-    );
-  }
-
   if (isReel) {
     return (
       <SafeAreaView
@@ -218,6 +269,10 @@ export function ArticlesScreen() {
           onPress={handleArticlePress}
           onRefresh={refreshAll}
           refreshing={refreshing}
+          onEndReached={handleLoadMore}
+          loadingMore={loadingMore}
+          initialScrollIndex={reelInitialIndex}
+          onVisibleIdChange={id => { visibleArticleIdRef.current = id; }}
         />
         <BottomBar
           activeTab={activeTab}
@@ -237,6 +292,7 @@ export function ArticlesScreen() {
       <Header title={filterLabel} viewMode={viewMode} onCycleView={cycleViewMode} />
 
       <FlatList
+        ref={flatListRef}
         data={articles}
         keyExtractor={a => a.id}
         renderItem={isCard ? renderCard : renderListItem}
@@ -248,6 +304,19 @@ export function ArticlesScreen() {
         ItemSeparatorComponent={isCard ? undefined : () => <Divider inset={56} />}
         onEndReached={articles.length > 0 ? handleLoadMore : undefined}
         onEndReachedThreshold={0.5}
+        onViewableItemsChanged={onListViewableItemsChanged}
+        viewabilityConfig={listViewabilityConfig.current}
+        onScrollToIndexFailed={info => {
+          // Fallback for variable-height lists: scroll to the approximate offset.
+          const wait = new Promise(resolve => setTimeout(resolve, 80));
+          wait.then(() => {
+            flatListRef.current?.scrollToIndex({
+              index: info.index,
+              animated: false,
+              viewPosition: 0,
+            });
+          });
+        }}
         windowSize={5}
         maxToRenderPerBatch={6}
         initialNumToRender={6}
@@ -263,15 +332,17 @@ export function ArticlesScreen() {
           articles.length > 0 ? <EndFooter loading={loadingMore} /> : null
         }
         ListEmptyComponent={
-          <View style={styles.empty}>
-            <Icon name="newspaper-outline" size={48} color="secondary" />
-            <Text variant="headingMd" color="secondary" style={{ marginTop: spacing[3] }}>
-              No articles
-            </Text>
-            <Text variant="bodyMd" color="tertiary" style={{ textAlign: 'center', marginTop: spacing[1] }}>
-              Add feeds via the Menu
-            </Text>
-          </View>
+          !loading ? (
+            <View style={styles.empty}>
+              <Icon name="newspaper-outline" size={48} color="secondary" />
+              <Text variant="headingMd" color="secondary" style={{ marginTop: spacing[3] }}>
+                No articles
+              </Text>
+              <Text variant="bodyMd" color="tertiary" style={{ textAlign: 'center', marginTop: spacing[1] }}>
+                Add feeds via the Menu
+              </Text>
+            </View>
+          ) : null
         }
       />
 
@@ -294,25 +365,35 @@ function ReelList({
   onPress,
   onRefresh,
   refreshing,
+  onEndReached,
+  loadingMore,
+  initialScrollIndex = 0,
+  onVisibleIdChange,
 }: {
   articles: Article[];
   onPress: (article: Article) => void;
   onRefresh: () => void;
   refreshing: boolean;
+  onEndReached: () => void;
+  loadingMore: boolean;
+  initialScrollIndex?: number;
+  onVisibleIdChange?: (id: string) => void;
 }) {
   const { colors, spacing } = useTheme();
   const { height: windowHeight } = useWindowDimensions();
   const insets = useSafeAreaInsets();
-  const [activeIndex, setActiveIndex] = useState(0);
+  const [activeIndex, setActiveIndex] = useState(initialScrollIndex);
 
   const itemHeight = windowHeight - insets.top - HEADER_HEIGHT - BAR_HEIGHT - insets.bottom;
 
   const viewabilityConfig = useRef({ itemVisiblePercentThreshold: 60 });
   const onViewableItemsChanged = useCallback(({ viewableItems }: any) => {
     if (viewableItems.length > 0) {
-      setActiveIndex(viewableItems[0].index ?? 0);
+      const idx = viewableItems[0].index ?? 0;
+      setActiveIndex(idx);
+      onVisibleIdChange?.(viewableItems[0].item.id);
     }
-  }, []);
+  }, [onVisibleIdChange]);
 
   const renderReel = useCallback(
     ({ item, index }: { item: Article; index: number }) => (
@@ -331,18 +412,27 @@ function ReelList({
       data={articles}
       keyExtractor={a => a.id}
       renderItem={renderReel}
-      pagingEnabled
       showsVerticalScrollIndicator={false}
       snapToInterval={itemHeight}
       snapToAlignment="start"
       decelerationRate="fast"
+      bounces={false}
+      overScrollMode="never"
+      onEndReached={articles.length > 0 ? onEndReached : undefined}
+      onEndReachedThreshold={3}
       getItemLayout={(_, index) => ({
         length: itemHeight,
         offset: itemHeight * index,
         index,
       })}
+      initialScrollIndex={initialScrollIndex > 0 && initialScrollIndex < articles.length ? initialScrollIndex : undefined}
       onViewableItemsChanged={onViewableItemsChanged}
       viewabilityConfig={viewabilityConfig.current}
+      onEndReached={articles.length > 0 ? onEndReached : undefined}
+      onEndReachedThreshold={1.5}
+      ListFooterComponent={
+        articles.length > 0 ? <EndFooter loading={loadingMore} /> : null
+      }
       windowSize={3}
       maxToRenderPerBatch={2}
       initialNumToRender={2}
@@ -355,15 +445,17 @@ function ReelList({
         />
       }
       ListEmptyComponent={
-        <View style={[styles.empty, { height: itemHeight }]}>
-          <Icon name="newspaper-outline" size={48} color="secondary" />
-          <Text variant="headingMd" color="secondary" style={{ marginTop: spacing[3] }}>
-            No articles
-          </Text>
-          <Text variant="bodyMd" color="tertiary" style={{ textAlign: 'center', marginTop: spacing[1] }}>
-            Add feeds via the Menu
-          </Text>
-        </View>
+        !loading ? (
+          <View style={[styles.empty, { height: itemHeight }]}>
+            <Icon name="newspaper-outline" size={48} color="secondary" />
+            <Text variant="headingMd" color="secondary" style={{ marginTop: spacing[3] }}>
+              No articles
+            </Text>
+            <Text variant="bodyMd" color="tertiary" style={{ textAlign: 'center', marginTop: spacing[1] }}>
+              Add feeds via the Menu
+            </Text>
+          </View>
+        ) : null
       }
     />
   );
@@ -553,11 +645,13 @@ function ReelVideo({
 // Ken Burns animated image
 // ---------------------------------------------------------------------------
 
+// Subtle pan directions, picked deterministically per image so each article
+// has a stable "feel" rather than a random one each render.
 const KB_DIRECTIONS = [
   { tx: -20, ty: -12 },
-  { tx: 20,  ty: -10 },
+  { tx:  20, ty: -10 },
   { tx: -15, ty:  15 },
-  { tx: 18,  ty:  10 },
+  { tx:  18, ty:  10 },
 ] as const;
 
 function KenBurnsImage({ uri, isActive }: { uri: string; isActive: boolean }) {
@@ -570,13 +664,23 @@ function KenBurnsImage({ uri, isActive }: { uri: string; isActive: boolean }) {
   useEffect(() => {
     if (isActive) {
       progress.setValue(0);
+      // Yoyo loop (0→1→0) so the motion reverses smoothly instead of snapping
+      // back at the end of each cycle.
       animRef.current = Animated.loop(
-        Animated.timing(progress, {
-          toValue: 1,
-          duration: 9000,
-          easing: Easing.linear,
-          useNativeDriver: true,
-        }),
+        Animated.sequence([
+          Animated.timing(progress, {
+            toValue: 1,
+            duration: 9000,
+            easing: Easing.inOut(Easing.quad),
+            useNativeDriver: true,
+          }),
+          Animated.timing(progress, {
+            toValue: 0,
+            duration: 9000,
+            easing: Easing.inOut(Easing.quad),
+            useNativeDriver: true,
+          }),
+        ]),
       );
       animRef.current.start();
     } else {
@@ -591,13 +695,14 @@ function KenBurnsImage({ uri, isActive }: { uri: string; isActive: boolean }) {
   const translateY = progress.interpolate({ inputRange: [0, 1], outputRange: [0, ty] });
 
   return (
-    <Animated.Image
+    <AnimatedExpoImage
       source={{ uri }}
       style={[
         StyleSheet.absoluteFill,
         { transform: [{ scale }, { translateX }, { translateY }] },
       ]}
-      resizeMode="cover"
+      contentFit="cover"
+      cachePolicy="disk"
     />
   );
 }
@@ -725,17 +830,14 @@ function Header({
 
 const FadeImage = React.memo(function FadeImage({ uri, style }: { uri: string; style: any }) {
   const { colors } = useTheme();
-  const opacity = useRef(new Animated.Value(0)).current;
-  const onLoad = useCallback(() => {
-    Animated.timing(opacity, { toValue: 1, duration: 250, useNativeDriver: true }).start();
-  }, [opacity]);
   return (
     <View style={[style, { backgroundColor: colors.skeleton, overflow: 'hidden' }]}>
-      <Animated.Image
+      <ExpoImage
         source={{ uri }}
-        style={[StyleSheet.absoluteFill, { opacity }]}
-        resizeMode="cover"
-        onLoad={onLoad}
+        style={StyleSheet.absoluteFill}
+        contentFit="cover"
+        cachePolicy="disk"
+        transition={250}
       />
     </View>
   );

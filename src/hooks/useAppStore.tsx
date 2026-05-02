@@ -3,13 +3,23 @@ import React, {
   useContext,
   useReducer,
   useEffect,
+  useRef,
   useCallback,
 } from 'react';
+import { AppState as RNAppState, AppStateStatus } from 'react-native';
 import { Folder, Feed, Settings, FeedFilter, Article } from '../types';
 import * as storage from '../services/storage';
 import * as db from '../services/db';
-import { fetchArticles, fetchFeedMeta, fetchOlderArticles, enrichWithImages } from '../services/rss';
+import {
+  fetchArticles,
+  fetchFeedMeta,
+  fetchOlderPage,
+  enrichWithImages,
+  PageCursor,
+} from '../services/rss';
 import { generateId, uuid } from '../utils/id';
+
+const STALE_AFTER_MS = 15 * 60 * 1000; // 15 minutes
 
 interface AppState {
   folders: Folder[];
@@ -78,13 +88,15 @@ function reducer(state: AppState, action: Action): AppState {
 interface AppContextValue {
   state: AppState;
   // Feeds
-  addFeed:    (url: string, folderId?: string) => Promise<void>;
-  removeFeed: (feedId: string) => Promise<void>;
-  moveFeed:   (feedId: string, folderId?: string) => Promise<void>;
+  addFeed:       (url: string, folderId?: string) => Promise<void>;
+  removeFeed:    (feedId: string) => Promise<void>;
+  moveFeed:      (feedId: string, folderId?: string) => Promise<void>;
+  reorderFeeds:  (feeds: Feed[]) => Promise<void>;
   // Folders
-  addFolder:    (name: string) => Promise<Folder>;
-  renameFolder: (folderId: string, name: string) => Promise<void>;
-  removeFolder: (folderId: string) => Promise<void>;
+  addFolder:     (name: string) => Promise<Folder>;
+  updateFolder:  (folderId: string, patch: Partial<Folder>) => Promise<void>;
+  removeFolder:  (folderId: string) => Promise<void>;
+  reorderFolders:(folders: Folder[]) => Promise<void>;
   // Articles
   markRead:    (articleId: string) => Promise<void>;
   markAllRead: (feedId: string) => Promise<void>;
@@ -92,7 +104,12 @@ interface AppContextValue {
   // Refresh
   refreshAll:  () => Promise<void>;
   refreshFeed: (feed: Feed) => Promise<void>;
-  fetchOlderFromNetwork: (filter: FeedFilter, page: number) => Promise<Article[]>;
+  // Per-feed cursors threaded by the screen so each "load more" advances the
+  // pagination state machine (URL-page → Wayback Machine → done).
+  fetchOlderFromNetwork: (
+    filter: FeedFilter,
+    cursors: Record<string, PageCursor>,
+  ) => Promise<{ articles: Article[]; cursors: Record<string, PageCursor>; allDone: boolean }>;
   // Filter
   setFilter: (filter: FeedFilter) => void;
   // Settings
@@ -120,23 +137,53 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     })();
   }, []);
 
+  // Foreground-resume refresh: re-fetch feeds that haven't been updated in 15+ minutes
+  const appStateRef = useRef<AppStateStatus>(RNAppState.currentState);
+  const feedsRef = useRef<Feed[]>(state.feeds);
+  useEffect(() => { feedsRef.current = state.feeds; }, [state.feeds]);
+
+  useEffect(() => {
+    const sub = RNAppState.addEventListener('change', (nextState: AppStateStatus) => {
+      const wasBackground = appStateRef.current !== 'active';
+      appStateRef.current = nextState;
+      if (nextState === 'active' && wasBackground) {
+        const stale = feedsRef.current.filter(
+          f => !f.lastFetched || Date.now() - f.lastFetched > STALE_AFTER_MS,
+        );
+        if (stale.length > 0) {
+          dispatch({ type: 'SET_REFRESHING', payload: true });
+          Promise.allSettled(stale.map(f => refreshFeed(f))).then(() => {
+            dispatch({ type: 'SET_REFRESHING', payload: false });
+          });
+        }
+      }
+    });
+    return () => sub.remove();
+  // refreshFeed is stable (no deps), feedsRef avoids re-subscribing on every feed change
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const refreshFeed = useCallback(async (feed: Feed) => {
     try {
-      const { articles, faviconUrl } = await fetchArticles(feed);
+      const { articles, faviconUrl, nextPageUrl } = await fetchArticles(feed);
       await db.upsertArticles(articles);
       const unreadCount = articles.filter(a => !a.isRead).length;
-      const updated = { ...feed, lastFetched: Date.now(), unreadCount, faviconUrl: faviconUrl ?? feed.faviconUrl };
+      const updated = { ...feed, lastFetched: Date.now(), unreadCount, faviconUrl: faviconUrl ?? feed.faviconUrl, nextPageUrl };
       await storage.saveFeed(updated);
       const allFeeds = await storage.getFeeds();
       dispatch({ type: 'SET_FEEDS', payload: allFeeds });
       dispatch({ type: 'BUMP_VERSION' });
-      // Enrich images async — articles already in DB, images fill in when ready
-      enrichWithImages(articles).then(async enriched => {
-        if (enriched.some(a => a.imageUrl)) {
-          await db.upsertArticles(enriched);
-          dispatch({ type: 'BUMP_VERSION' });
-        }
-      });
+      // Enrich images async — only for articles that have no image from the feed
+      const needsEnrich = articles.filter(a => !a.imageUrl);
+      if (needsEnrich.length > 0) {
+        enrichWithImages(articles).then(async () => {
+          const gained = needsEnrich.filter(a => a.imageUrl);
+          if (gained.length > 0) {
+            await db.upsertArticles(articles);
+            dispatch({ type: 'BUMP_VERSION' });
+          }
+        }).catch(e => console.warn('Image enrichment error', e));
+      }
     } catch (e) {
       console.warn('Feed fetch error', feed.url, e);
     }
@@ -148,8 +195,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     dispatch({ type: 'SET_REFRESHING', payload: false });
   }, [state.feeds, refreshFeed]);
 
-  const fetchOlderFromNetwork = useCallback(async (filter: FeedFilter, page: number): Promise<Article[]> => {
-    if (filter.type === 'bookmarks') return [];
+  const fetchOlderFromNetwork = useCallback(async (
+    filter: FeedFilter,
+    cursors: Record<string, PageCursor>,
+  ): Promise<{ articles: Article[]; cursors: Record<string, PageCursor>; allDone: boolean }> => {
+    if (filter.type === 'bookmarks') {
+      return { articles: [], cursors, allDone: true };
+    }
 
     let feedsToFetch: Feed[];
     if (filter.type === 'feed') {
@@ -161,17 +213,41 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
 
     const existingIds = await db.getAllArticleIds();
+    const nextCursors: Record<string, PageCursor> = { ...cursors };
+
     const results = await Promise.allSettled(
-      feedsToFetch.map(feed => fetchOlderArticles(feed, page, existingIds)),
+      feedsToFetch
+        .filter(f => (cursors[f.id]?.kind ?? 'urlPage') !== 'done')
+        .map(async feed => {
+          const cur = cursors[feed.id] ?? ({ kind: 'urlPage', page: 2 } as PageCursor);
+          const { articles, cursor } = await fetchOlderPage(feed, cur, existingIds);
+          nextCursors[feed.id] = cursor;
+          return articles;
+        }),
     );
+
     const fresh: Article[] = [];
-    for (const r of results) {
-      if (r.status === 'fulfilled') fresh.push(...r.value);
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.status !== 'fulfilled') continue;
+      fresh.push(...r.value.articles);
     }
     if (fresh.length > 0) {
       await db.upsertArticles(fresh);
+      const needsEnrich = fresh.filter(a => !a.imageUrl);
+      if (needsEnrich.length > 0) {
+        enrichWithImages(fresh).then(async () => {
+          const gained = needsEnrich.filter(a => a.imageUrl);
+          if (gained.length > 0) {
+            await db.upsertArticles(fresh);
+            dispatch({ type: 'BUMP_VERSION' });
+          }
+        }).catch(e => console.warn('Image enrichment error', e));
+      }
     }
-    return fresh;
+
+    const allDone = feedsToFetch.every(f => (nextCursors[f.id]?.kind ?? 'urlPage') === 'done');
+    return { articles: fresh, cursors: nextCursors, allDone };
   }, [state.feeds]);
 
   const addFeed = useCallback(async (url: string, folderId?: string) => {
@@ -209,6 +285,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     dispatch({ type: 'BUMP_VERSION' });
   }, [state.feeds]);
 
+  const reorderFolders = useCallback(async (reordered: Folder[]) => {
+    await storage.saveFolders(reordered);
+    dispatch({ type: 'SET_FOLDERS', payload: reordered });
+  }, []);
+
+  const reorderFeeds = useCallback(async (reordered: Feed[]) => {
+    await storage.saveFeeds(reordered);
+    dispatch({ type: 'SET_FEEDS', payload: reordered });
+  }, []);
+
   const addFolder = useCallback(async (name: string): Promise<Folder> => {
     const folder: Folder = { id: uuid(), name, createdAt: Date.now() };
     await storage.saveFolder(folder);
@@ -217,10 +303,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return folder;
   }, []);
 
-  const renameFolder = useCallback(async (folderId: string, name: string) => {
+  const updateFolder = useCallback(async (folderId: string, patch: Partial<Folder>) => {
     const folder = state.folders.find(f => f.id === folderId);
     if (!folder) return;
-    await storage.saveFolder({ ...folder, name });
+    await storage.saveFolder({ ...folder, ...patch, id: folder.id });
     const folders = await storage.getFolders();
     dispatch({ type: 'SET_FOLDERS', payload: folders });
   }, [state.folders]);
@@ -277,9 +363,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     addFeed,
     removeFeed,
     moveFeed,
+    reorderFeeds,
     addFolder,
-    renameFolder,
+    updateFolder,
     removeFolder,
+    reorderFolders,
     markRead,
     markAllRead,
     toggleBookmark,

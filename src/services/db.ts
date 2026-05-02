@@ -3,7 +3,21 @@ import { Article } from '../types';
 
 const db = SQLite.openDatabaseSync('kern.db');
 
+// Serialise all writes through a single promise chain so concurrent
+// refreshFeed calls never try to open overlapping transactions.
+let writeQueue: Promise<void> = Promise.resolve();
+function enqueueWrite<T>(fn: () => Promise<T>): Promise<T> {
+  const next = writeQueue.then(fn);
+  // Keep the queue moving even if fn throws
+  writeQueue = next.then(() => {}, () => {});
+  return next;
+}
+
 export function initDB(): void {
+  // WAL mode: concurrent reads during background writes, no SQLITE_BUSY errors
+  db.execSync(`PRAGMA journal_mode = WAL`);
+  db.execSync(`PRAGMA synchronous = NORMAL`);
+  db.execSync(`PRAGMA busy_timeout = 2000`);
   db.execSync(`
     CREATE TABLE IF NOT EXISTS articles (
       id            TEXT    PRIMARY KEY,
@@ -21,9 +35,10 @@ export function initDB(): void {
       is_bookmarked INTEGER NOT NULL DEFAULT 0,
       fetched_at    INTEGER NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_art_pub  ON articles(pub_date DESC);
-    CREATE INDEX IF NOT EXISTS idx_art_feed ON articles(feed_id, pub_date DESC);
-    CREATE INDEX IF NOT EXISTS idx_art_bkm  ON articles(is_bookmarked, pub_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_art_pub    ON articles(pub_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_art_feed   ON articles(feed_id, pub_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_art_bkm    ON articles(is_bookmarked, pub_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_art_unread ON articles(is_read, pub_date DESC);
   `);
 }
 
@@ -46,32 +61,39 @@ function rowToArticle(row: any): Article {
   };
 }
 
-export async function upsertArticles(articles: Article[]): Promise<void> {
-  if (articles.length === 0) return;
-  await db.withTransactionAsync(async () => {
-    for (const a of articles) {
-      await db.runAsync(
-        `INSERT INTO articles
-           (id, feed_id, feed_title, title, summary, content, link, image_url,
-            video_urls, author, pub_date, is_read, is_bookmarked, fetched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           feed_title = excluded.feed_title,
-           title      = excluded.title,
-           summary    = excluded.summary,
-           content    = excluded.content,
-           link       = excluded.link,
-           image_url  = COALESCE(excluded.image_url, image_url),
-           video_urls = excluded.video_urls,
-           author     = excluded.author,
-           pub_date   = excluded.pub_date,
-           fetched_at = excluded.fetched_at`,
-        a.id, a.feedId, a.feedTitle, a.title,
-        a.summary ?? null, a.content ?? null, a.link,
-        a.imageUrl ?? null,
-        a.videoUrls?.length ? JSON.stringify(a.videoUrls) : null,
-        a.author ?? null, a.pubDate, a.fetchedAt,
-      );
+export function upsertArticles(articles: Article[]): Promise<void> {
+  if (articles.length === 0) return Promise.resolve();
+  return enqueueWrite(async () => {
+    db.execSync('BEGIN');
+    try {
+      for (const a of articles) {
+        db.runSync(
+          `INSERT INTO articles
+             (id, feed_id, feed_title, title, summary, content, link, image_url,
+              video_urls, author, pub_date, is_read, is_bookmarked, fetched_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             feed_title = excluded.feed_title,
+             title      = excluded.title,
+             summary    = excluded.summary,
+             content    = excluded.content,
+             link       = excluded.link,
+             image_url  = COALESCE(excluded.image_url, image_url),
+             video_urls = excluded.video_urls,
+             author     = excluded.author,
+             pub_date   = excluded.pub_date,
+             fetched_at = excluded.fetched_at`,
+          a.id, a.feedId, a.feedTitle, a.title,
+          a.summary ?? null, a.content ?? null, a.link,
+          a.imageUrl ?? null,
+          a.videoUrls?.length ? JSON.stringify(a.videoUrls) : null,
+          a.author ?? null, a.pubDate, a.fetchedAt,
+        );
+      }
+      db.execSync('COMMIT');
+    } catch (e) {
+      db.execSync('ROLLBACK');
+      throw e;
     }
   });
 }
@@ -81,7 +103,11 @@ export interface QueryOptions {
   bookmarksOnly?: boolean;
   hideRead?: boolean;
   limit: number;
-  offset: number;
+  // Either offset OR cursor; cursor wins if both are set.
+  // Cursor pagination is stable when rows get filtered out mid-scroll
+  // (e.g. articles being marked read while hideRead is on).
+  offset?: number;
+  cursor?: { pubDate: number; id: string };
 }
 
 export async function queryArticles(opts: QueryOptions): Promise<Article[]> {
@@ -97,13 +123,24 @@ export async function queryArticles(opts: QueryOptions): Promise<Article[]> {
     params.push(...opts.feedIds);
   }
 
-  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-  params.push(opts.limit, opts.offset);
+  if (opts.cursor) {
+    // Strictly older than the cursor row in (pub_date DESC, id DESC) order
+    conditions.push('(pub_date < ? OR (pub_date = ? AND id < ?))');
+    params.push(opts.cursor.pubDate, opts.cursor.pubDate, opts.cursor.id);
+  }
 
-  const rows = await db.getAllAsync(
-    `SELECT * FROM articles ${where} ORDER BY pub_date DESC LIMIT ? OFFSET ?`,
-    params,
-  ) as any[];
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  let sql: string;
+  if (opts.cursor) {
+    params.push(opts.limit);
+    sql = `SELECT * FROM articles ${where} ORDER BY pub_date DESC, id DESC LIMIT ?`;
+  } else {
+    params.push(opts.limit, opts.offset ?? 0);
+    sql = `SELECT * FROM articles ${where} ORDER BY pub_date DESC, id DESC LIMIT ? OFFSET ?`;
+  }
+
+  const rows = await db.getAllAsync(sql, params) as any[];
   return rows.map(rowToArticle);
 }
 
@@ -138,4 +175,40 @@ export async function deleteArticlesByFeed(feedId: string): Promise<void> {
 
 export function clearArticles(): void {
   db.execSync('DELETE FROM articles');
+}
+
+function decodeEntities(text: string): string {
+  return text
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, ' ');
+}
+
+export async function fixStoredEntities(): Promise<void> {
+  const rows = await db.getAllAsync(
+    `SELECT id, title, summary FROM articles WHERE title LIKE '%&#%' OR summary LIKE '%&#%'`,
+  ) as { id: string; title: string; summary: string | null }[];
+  if (rows.length === 0) return;
+  return enqueueWrite(async () => {
+    db.execSync('BEGIN');
+    try {
+      for (const row of rows) {
+        db.runSync(
+          'UPDATE articles SET title = ?, summary = ? WHERE id = ?',
+          decodeEntities(row.title),
+          row.summary ? decodeEntities(row.summary) : null,
+          row.id,
+        );
+      }
+      db.execSync('COMMIT');
+    } catch (e) {
+      db.execSync('ROLLBACK');
+      throw e;
+    }
+  });
 }

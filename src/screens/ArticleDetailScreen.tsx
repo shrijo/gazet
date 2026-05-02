@@ -2,12 +2,12 @@ import React, { useCallback, useState } from 'react';
 import {
   View,
   ScrollView,
-  Image,
   StyleSheet,
   TouchableOpacity,
   Share,
   Linking,
 } from 'react-native';
+import { Image as ExpoImage } from 'expo-image';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { useTheme } from '../theme';
@@ -90,7 +90,7 @@ export function ArticleDetailScreen() {
         showsVerticalScrollIndicator={false}
       >
         {article.imageUrl ? (
-          <Image source={{ uri: article.imageUrl }} style={styles.hero} resizeMode="cover" />
+          <ExpoImage source={{ uri: article.imageUrl }} style={styles.hero} contentFit="cover" cachePolicy="disk" />
         ) : null}
 
         <View style={[styles.body, { paddingHorizontal: spacing[4] }]}>

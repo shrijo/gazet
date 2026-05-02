@@ -50,8 +50,10 @@ export function SettingsScreen() {
       style={[styles.container, { backgroundColor: colors.drawer }]}
       edges={['bottom']}
     >
-      <View style={[styles.header, { paddingHorizontal: spacing[4], paddingTop: insets.top }]}>
-        <Text variant="headingMd" style={{ color: colors.textPrimary }}>Settings</Text>
+      <View style={{ paddingTop: insets.top }}>
+        <View style={[styles.header, { paddingHorizontal: spacing[4] }]}>
+          <Text variant="headingMd" style={{ color: colors.textPrimary }}>Settings</Text>
+        </View>
       </View>
 
       <View style={{ height: 1, backgroundColor: colors.drawerDivider }} />
@@ -222,9 +224,9 @@ function SegmentedControl<T extends string>({
 const styles = StyleSheet.create({
   container: { flex: 1 },
   header: {
+    height: 56, // matches HEADER_HEIGHT in ArticlesScreen so the divider lines up
     flexDirection: 'row',
     alignItems: 'center',
-    paddingBottom: 16,
   },
   row: {
     flexDirection: 'row',
