@@ -418,7 +418,7 @@ function ReelList({
       decelerationRate="fast"
       bounces={false}
       overScrollMode="never"
-      onEndReached={articles.length > 0 ? onLoadMore : undefined}
+      onEndReached={articles.length > 0 ? onEndReached : undefined}
       onEndReachedThreshold={3}
       getItemLayout={(_, index) => ({
         length: itemHeight,

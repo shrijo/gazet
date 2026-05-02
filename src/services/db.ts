@@ -3,6 +3,16 @@ import { Article } from '../types';
 
 const db = SQLite.openDatabaseSync('kern.db');
 
+// Serialise all writes through a single promise chain so concurrent
+// refreshFeed calls never try to open overlapping transactions.
+let writeQueue: Promise<void> = Promise.resolve();
+function enqueueWrite<T>(fn: () => Promise<T>): Promise<T> {
+  const next = writeQueue.then(fn);
+  // Keep the queue moving even if fn throws
+  writeQueue = next.then(() => {}, () => {});
+  return next;
+}
+
 export function initDB(): void {
   // WAL mode: concurrent reads during background writes, no SQLITE_BUSY errors
   db.execSync(`PRAGMA journal_mode = WAL`);
@@ -51,32 +61,39 @@ function rowToArticle(row: any): Article {
   };
 }
 
-export async function upsertArticles(articles: Article[]): Promise<void> {
-  if (articles.length === 0) return;
-  await db.withTransactionAsync(async () => {
-    for (const a of articles) {
-      await db.runAsync(
-        `INSERT INTO articles
-           (id, feed_id, feed_title, title, summary, content, link, image_url,
-            video_urls, author, pub_date, is_read, is_bookmarked, fetched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           feed_title = excluded.feed_title,
-           title      = excluded.title,
-           summary    = excluded.summary,
-           content    = excluded.content,
-           link       = excluded.link,
-           image_url  = COALESCE(excluded.image_url, image_url),
-           video_urls = excluded.video_urls,
-           author     = excluded.author,
-           pub_date   = excluded.pub_date,
-           fetched_at = excluded.fetched_at`,
-        a.id, a.feedId, a.feedTitle, a.title,
-        a.summary ?? null, a.content ?? null, a.link,
-        a.imageUrl ?? null,
-        a.videoUrls?.length ? JSON.stringify(a.videoUrls) : null,
-        a.author ?? null, a.pubDate, a.fetchedAt,
-      );
+export function upsertArticles(articles: Article[]): Promise<void> {
+  if (articles.length === 0) return Promise.resolve();
+  return enqueueWrite(async () => {
+    db.execSync('BEGIN');
+    try {
+      for (const a of articles) {
+        db.runSync(
+          `INSERT INTO articles
+             (id, feed_id, feed_title, title, summary, content, link, image_url,
+              video_urls, author, pub_date, is_read, is_bookmarked, fetched_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             feed_title = excluded.feed_title,
+             title      = excluded.title,
+             summary    = excluded.summary,
+             content    = excluded.content,
+             link       = excluded.link,
+             image_url  = COALESCE(excluded.image_url, image_url),
+             video_urls = excluded.video_urls,
+             author     = excluded.author,
+             pub_date   = excluded.pub_date,
+             fetched_at = excluded.fetched_at`,
+          a.id, a.feedId, a.feedTitle, a.title,
+          a.summary ?? null, a.content ?? null, a.link,
+          a.imageUrl ?? null,
+          a.videoUrls?.length ? JSON.stringify(a.videoUrls) : null,
+          a.author ?? null, a.pubDate, a.fetchedAt,
+        );
+      }
+      db.execSync('COMMIT');
+    } catch (e) {
+      db.execSync('ROLLBACK');
+      throw e;
     }
   });
 }
@@ -177,14 +194,21 @@ export async function fixStoredEntities(): Promise<void> {
     `SELECT id, title, summary FROM articles WHERE title LIKE '%&#%' OR summary LIKE '%&#%'`,
   ) as { id: string; title: string; summary: string | null }[];
   if (rows.length === 0) return;
-  await db.withTransactionAsync(async () => {
-    for (const row of rows) {
-      await db.runAsync(
-        'UPDATE articles SET title = ?, summary = ? WHERE id = ?',
-        decodeEntities(row.title),
-        row.summary ? decodeEntities(row.summary) : null,
-        row.id,
-      );
+  return enqueueWrite(async () => {
+    db.execSync('BEGIN');
+    try {
+      for (const row of rows) {
+        db.runSync(
+          'UPDATE articles SET title = ?, summary = ? WHERE id = ?',
+          decodeEntities(row.title),
+          row.summary ? decodeEntities(row.summary) : null,
+          row.id,
+        );
+      }
+      db.execSync('COMMIT');
+    } catch (e) {
+      db.execSync('ROLLBACK');
+      throw e;
     }
   });
 }
