@@ -21,6 +21,7 @@ const DEFAULT_SETTINGS: Settings = {
 
 const MIGRATION_V4 = '@kern/migration_v4';
 const MIGRATION_V5 = '@kern/migration_v5';
+const MIGRATION_V6 = '@kern/migration_v6';
 
 export async function runMigrations(): Promise<void> {
   // v4: move AsyncStorage articles → SQLite
@@ -44,6 +45,12 @@ export async function runMigrations(): Promise<void> {
   if (!await AsyncStorage.getItem(MIGRATION_V5)) {
     db.clearArticles();
     await AsyncStorage.setItem(MIGRATION_V5, '1');
+  }
+
+  // v6: decode HTML entities (e.g. &#8217;) in stored article titles/summaries
+  if (!await AsyncStorage.getItem(MIGRATION_V6)) {
+    await db.fixStoredEntities();
+    await AsyncStorage.setItem(MIGRATION_V6, '1');
   }
 }
 

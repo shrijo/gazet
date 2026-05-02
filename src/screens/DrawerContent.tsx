@@ -317,12 +317,12 @@ export function DrawerContent() {
       </View>
 
       {/* Feed Actions Modal */}
-      <Modal visible={showFeedActions} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setShowFeedActions(false)}>
+      <Modal visible={showFeedActions} animationType="slide" presentationStyle="fullScreen" onRequestClose={() => setShowFeedActions(false)}>
         <SafeAreaView style={[styles.modal, { backgroundColor: colors.surface }]} edges={['top', 'bottom']}>
           <View style={[styles.modalHeader, { paddingHorizontal: spacing[4] }]}>
             <Text variant="headingMd" numberOfLines={1} style={{ flex: 1, marginRight: spacing[3] }}>{selectedFeed?.title}</Text>
             <TouchableOpacity onPress={() => setShowFeedActions(false)}>
-              <Text variant="labelMd" color="secondary">Close</Text>
+              <Icon name="close-outline" size={24} color="secondary" />
             </TouchableOpacity>
           </View>
           <ScrollView contentContainerStyle={{ paddingHorizontal: spacing[4], gap: spacing[3] }}>
@@ -364,7 +364,9 @@ export function DrawerContent() {
         <SafeAreaView style={[styles.modal, { backgroundColor: colors.surface }]} edges={['top', 'bottom']}>
           <View style={[styles.modalHeader, { paddingHorizontal: spacing[4] }]}>
             <Text variant="headingMd">New Folder</Text>
-            <TouchableOpacity onPress={() => setShowAddFolder(false)}><Text variant="labelMd" color="secondary">Close</Text></TouchableOpacity>
+            <TouchableOpacity onPress={() => setShowAddFolder(false)}>
+              <Icon name="close-outline" size={24} color="secondary" />
+            </TouchableOpacity>
           </View>
           <View style={{ paddingHorizontal: spacing[4], gap: spacing[3] }}>
             <TextInput

@@ -27,36 +27,79 @@ function isVideoMedia(m: any): boolean {
   return m['@_medium'] === 'video' || String(m['@_type'] ?? '').startsWith('video/');
 }
 
+function attrWidth(node: any): number {
+  return parseInt(node?.['@_width'] ?? '0', 10) || 0;
+}
+
+// Pick the thumbnail with the largest @_width attribute (falls back to first).
+function bestThumbnail(thumbnails: any[]): string | undefined {
+  if (!thumbnails?.length) return undefined;
+  const best = thumbnails.reduce((a, b) => (attrWidth(b) > attrWidth(a) ? b : a));
+  return toAbsoluteUrl(best?.['@_url']);
+}
+
+// Pick the media:content image item with the largest @_width (falls back to first non-video).
+function bestImageContent(items: any[]): any | undefined {
+  const imgs = items.filter((m: any) => !isVideoMedia(m));
+  if (!imgs.length) return undefined;
+  return imgs.reduce((a: any, b: any) => (attrWidth(b) > attrWidth(a) ? b : a));
+}
+
 function getThumbnailUrl(node: any): string | undefined {
   if (!node) return undefined;
   const t = node['media:thumbnail'];
-  return toAbsoluteUrl(
-    (Array.isArray(t) ? t[0]?.['@_url'] : t?.['@_url']) ?? node['@_thumbnail'],
-  );
+  if (Array.isArray(t)) return bestThumbnail(t);
+  return toAbsoluteUrl(t?.['@_url'] ?? node['@_thumbnail']);
+}
+
+// Find the best-quality <img> in HTML: widest explicit width wins; tracking pixels (≤2px) are skipped.
+// Also checks data-src / data-lazy-src for lazy-loaded images common on modern sites.
+function getBestHtmlImage(html: string): string | undefined {
+  const imgTagRe = /<img[^>]+>/gi;
+  // Match src, data-src, or data-lazy-src — whichever holds an absolute URL
+  const srcRe = /(?:data-lazy-src|data-src|src)=["']?(https?:\/\/[^"'\s>]+)["']?/i;
+  const wRe = /\bwidth=["']?(\d+)["']?/i;
+  const hRe = /\bheight=["']?(\d+)["']?/i;
+
+  const candidates: { url: string; width: number }[] = [];
+  let tag: RegExpExecArray | null;
+  while ((tag = imgTagRe.exec(html)) !== null) {
+    const srcMatch = tag[0].match(srcRe);
+    if (!srcMatch?.[1]) continue;
+    const w = parseInt((tag[0].match(wRe) ?? [])[1] ?? '0', 10) || 0;
+    const h = parseInt((tag[0].match(hRe) ?? [])[1] ?? '0', 10) || 0;
+    // Skip obvious tracking pixels
+    if ((w > 0 && w <= 2) || (h > 0 && h <= 2)) continue;
+    candidates.push({ url: srcMatch[1], width: w });
+  }
+  if (!candidates.length) return undefined;
+  const withWidth = candidates.filter(c => c.width > 0);
+  if (withWidth.length) return withWidth.reduce((a, b) => (b.width > a.width ? b : a)).url;
+  return candidates[0].url;
 }
 
 function extractImage(item: any): string | undefined {
-  // media:group (YouTube, podcast feeds) — thumbnail lives here
+  // media:group (YouTube, podcast feeds) — pick the highest-res thumbnail
   const mediaGroup = item['media:group'];
   if (mediaGroup) {
     const groupThumb = mediaGroup['media:thumbnail'];
-    const u = toAbsoluteUrl(
-      Array.isArray(groupThumb) ? groupThumb[0]?.['@_url'] : groupThumb?.['@_url'],
-    );
+    const u = Array.isArray(groupThumb)
+      ? bestThumbnail(groupThumb)
+      : toAbsoluteUrl(groupThumb?.['@_url']);
     if (u) return u;
     // also check image-typed media:content inside the group
     const groupContent = mediaGroup['media:content'];
     if (Array.isArray(groupContent)) {
-      const img = groupContent.find((m: any) => !isVideoMedia(m));
+      const img = bestImageContent(groupContent);
       const cu = toAbsoluteUrl(img?.['@_url']);
       if (cu) return cu;
     }
   }
 
-  // media:content — image items first, then thumbnail embedded on video items
+  // media:content — highest-res image item first, then thumbnail embedded on video items
   const mediaContent = item['media:content'];
   if (Array.isArray(mediaContent)) {
-    const img = mediaContent.find((m: any) => !isVideoMedia(m));
+    const img = bestImageContent(mediaContent);
     const u = toAbsoluteUrl(img?.['@_url']);
     if (u) return u;
     // video items sometimes carry a nested thumbnail
@@ -69,15 +112,19 @@ function extractImage(item: any): string | undefined {
     if (u) return u;
   }
 
-  // standalone media:thumbnail
+  // standalone media:thumbnail — pick highest-res
   const mediaThumbnail = item['media:thumbnail'];
   if (Array.isArray(mediaThumbnail) && mediaThumbnail.length > 0) {
-    const u = toAbsoluteUrl(mediaThumbnail[0]?.['@_url']);
+    const u = bestThumbnail(mediaThumbnail);
     if (u) return u;
   } else if (mediaThumbnail?.['@_url']) {
     const u = toAbsoluteUrl(mediaThumbnail['@_url']);
     if (u) return u;
   }
+
+  // itunes:image per-item (common in podcast feeds for episode artwork)
+  const itunesImage = toAbsoluteUrl(item['itunes:image']?.['@_href']);
+  if (itunesImage) return itunesImage;
 
   // image enclosure
   const enclosures: any[] = Array.isArray(item.enclosure) ? item.enclosure : [];
@@ -85,17 +132,14 @@ function extractImage(item: any): string | undefined {
   const encUrl = toAbsoluteUrl(imgEnclosure?.['@_url']);
   if (encUrl) return encUrl;
 
-  // first <img> in content — matches quoted or unquoted src, absolute URLs only
+  // best <img> in content — widest explicit width wins; tracking pixels skipped
   const html =
     getText(item['content:encoded']) ||
     getText(item.content) ||
     getText(item.description) ||
     getText(item.summary) ||
     '';
-  const match = html.match(/<img[^>]+src=["']?(https?:\/\/[^"'\s>]+)["']?/i);
-  if (match?.[1]) return match[1];
-
-  return undefined;
+  return getBestHtmlImage(html);
 }
 
 function extractVideos(item: any): string[] {
@@ -124,7 +168,9 @@ function stripHtml(html: string): string {
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -140,11 +186,17 @@ function getFaviconUrl(siteUrl: string): string {
 
 async function fetchOgImage(url: string): Promise<string | undefined> {
   try {
-    const res = await fetch(url, { headers: { Accept: 'text/html' } });
+    const res = await fetch(url, {
+      headers: {
+        Accept: 'text/html',
+        // Many sites block requests without a browser UA; use a realistic mobile one
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+      },
+    });
     if (!res.ok) return undefined;
     const text = await res.text();
-    // Scan enough of the head to find og:image (typically within first 8kb)
-    const head = text.slice(0, 8000);
+    // Scan enough of the head; some CMSes emit large inline scripts before <meta> tags
+    const head = text.slice(0, 16000);
     const match =
       head.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i) ??
       head.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i) ??
@@ -152,11 +204,15 @@ async function fetchOgImage(url: string): Promise<string | undefined> {
       head.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i);
     let imgUrl = match?.[1];
     if (!imgUrl) return undefined;
-    // normalize protocol-relative URLs
-    if (imgUrl.startsWith('//')) imgUrl = 'https:' + imgUrl;
-    // discard relative URLs (no base URL context available)
-    if (!imgUrl.startsWith('http')) return undefined;
-    return imgUrl;
+    if (imgUrl.startsWith('//')) return 'https:' + imgUrl;
+    if (imgUrl.startsWith('http')) return imgUrl;
+    // Reconstruct relative URLs from the article's origin
+    try {
+      const { origin } = new URL(url);
+      return origin + (imgUrl.startsWith('/') ? imgUrl : '/' + imgUrl);
+    } catch {
+      return undefined;
+    }
   } catch {
     return undefined;
   }
@@ -193,6 +249,24 @@ async function enrichWithImages(articles: Article[]): Promise<Article[]> {
     });
   }
   return articles;
+}
+
+// Extract Atom RFC 5005 <link rel="next"> from a parsed feed document.
+// Works for Atom feeds and RSS 2.0 feeds that use the atom:link extension.
+function getAtomNextLink(doc: any): string | undefined {
+  const feedLinks = doc?.feed?.link;
+  if (feedLinks) {
+    const arr = Array.isArray(feedLinks) ? feedLinks : [feedLinks];
+    const href = arr.find((l: any) => l?.['@_rel'] === 'next')?.['@_href'];
+    if (href) return toAbsoluteUrl(href);
+  }
+  const channelLinks = doc?.rss?.channel?.['atom:link'];
+  if (channelLinks) {
+    const arr = Array.isArray(channelLinks) ? channelLinks : [channelLinks];
+    const href = arr.find((l: any) => l?.['@_rel'] === 'next')?.['@_href'];
+    if (href) return toAbsoluteUrl(href);
+  }
+  return undefined;
 }
 
 function paginatedUrls(baseUrl: string, page: number): string[] {
@@ -321,16 +395,6 @@ async function fetchWaybackSnapshots(feedUrl: string): Promise<string[]> {
   }
 }
 
-// Backwards-compatible wrapper used by the older call site (deprecated path).
-export async function fetchOlderArticles(
-  feed: Feed,
-  page: number,
-  existingIds: Set<string>,
-): Promise<Article[]> {
-  const { articles } = await fetchOlderPage(feed, { kind: 'urlPage', page }, existingIds);
-  return articles;
-}
-
 export { enrichWithImages };
 
 export async function fetchFeedMeta(url: string): Promise<Partial<Feed>> {
@@ -350,7 +414,7 @@ export async function fetchFeedMeta(url: string): Promise<Partial<Feed>> {
   return { title, description, faviconUrl };
 }
 
-export async function fetchArticles(feed: Feed): Promise<{ articles: Article[]; faviconUrl?: string }> {
+export async function fetchArticles(feed: Feed): Promise<{ articles: Article[]; faviconUrl?: string; nextPageUrl?: string }> {
   const doc = await fetchXml(feed.url);
   const now = Date.now();
 
@@ -375,9 +439,10 @@ export async function fetchArticles(feed: Feed): Promise<{ articles: Article[]; 
     articles = items.map(item => parseRssItem(item, feed, now));
   }
 
+  const nextPageUrl = getAtomNextLink(doc);
   articles = await enrichWithImages(articles);
 
-  return { articles, faviconUrl };
+  return { articles, faviconUrl, nextPageUrl };
 }
 
 function parseRssItem(item: any, feed: Feed, now: number): Article {

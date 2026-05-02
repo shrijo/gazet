@@ -4,6 +4,10 @@ import { Article } from '../types';
 const db = SQLite.openDatabaseSync('kern.db');
 
 export function initDB(): void {
+  // WAL mode: concurrent reads during background writes, no SQLITE_BUSY errors
+  db.execSync(`PRAGMA journal_mode = WAL`);
+  db.execSync(`PRAGMA synchronous = NORMAL`);
+  db.execSync(`PRAGMA busy_timeout = 2000`);
   db.execSync(`
     CREATE TABLE IF NOT EXISTS articles (
       id            TEXT    PRIMARY KEY,
@@ -21,9 +25,10 @@ export function initDB(): void {
       is_bookmarked INTEGER NOT NULL DEFAULT 0,
       fetched_at    INTEGER NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_art_pub  ON articles(pub_date DESC);
-    CREATE INDEX IF NOT EXISTS idx_art_feed ON articles(feed_id, pub_date DESC);
-    CREATE INDEX IF NOT EXISTS idx_art_bkm  ON articles(is_bookmarked, pub_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_art_pub    ON articles(pub_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_art_feed   ON articles(feed_id, pub_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_art_bkm    ON articles(is_bookmarked, pub_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_art_unread ON articles(is_read, pub_date DESC);
   `);
 }
 
@@ -153,4 +158,33 @@ export async function deleteArticlesByFeed(feedId: string): Promise<void> {
 
 export function clearArticles(): void {
   db.execSync('DELETE FROM articles');
+}
+
+function decodeEntities(text: string): string {
+  return text
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, ' ');
+}
+
+export async function fixStoredEntities(): Promise<void> {
+  const rows = await db.getAllAsync(
+    `SELECT id, title, summary FROM articles WHERE title LIKE '%&#%' OR summary LIKE '%&#%'`,
+  ) as { id: string; title: string; summary: string | null }[];
+  if (rows.length === 0) return;
+  await db.withTransactionAsync(async () => {
+    for (const row of rows) {
+      await db.runAsync(
+        'UPDATE articles SET title = ?, summary = ? WHERE id = ?',
+        decodeEntities(row.title),
+        row.summary ? decodeEntities(row.summary) : null,
+        row.id,
+      );
+    }
+  });
 }
