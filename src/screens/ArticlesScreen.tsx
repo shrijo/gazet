@@ -445,7 +445,7 @@ function ReelList({
         />
       }
       ListEmptyComponent={
-        !loading ? (
+        articles.length === 0 && !loadingMore ? (
           <View style={[styles.empty, { height: itemHeight }]}>
             <Icon name="newspaper-outline" size={48} color="secondary" />
             <Text variant="headingMd" color="secondary" style={{ marginTop: spacing[3] }}>
