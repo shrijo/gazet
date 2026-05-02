@@ -156,49 +156,68 @@ export function ArticlesScreen() {
     loadingMoreRef.current = true;
     if (withSpinner) setLoadingMore(true);
     try {
+      // Use the live ref so an articleVersion bump mid-await can't desync
+      // the cursor we pass to the next query. Capture by id+pubDate (a value)
+      // rather than the array index so re-renders don't invalidate it.
+      const lastBefore = articlesRef.current[articlesRef.current.length - 1];
+      const cursorBefore = lastBefore
+        ? { pubDate: lastBefore.pubDate, id: lastBefore.id }
+        : undefined;
+
       // First: next page from local SQLite via cursor pagination so the offset
       // doesn't drift when articles get marked read during scrolling.
-      const last = articles[articles.length - 1];
       const fresh = await queryArticles({
         ...buildQueryOpts(filter, feeds, settings.hideReadArticles, 0),
-        cursor: last ? { pubDate: last.pubDate, id: last.id } : undefined,
+        cursor: cursorBefore,
       });
       if (fresh.length > 0) {
-        setArticles(prev => [...prev, ...fresh]);
+        const knownIds = new Set(articlesRef.current.map(a => a.id));
+        const additions = fresh.filter(a => !knownIds.has(a.id));
+        if (additions.length > 0) setArticles(prev => [...prev, ...additions]);
         return;
       }
-      // SQLite exhausted — try the network (URL pagination, then Wayback Machine).
-      if (filter.type !== 'bookmarks') {
+
+      if (filter.type === 'bookmarks') {
+        noMoreRef.current = true;
+        return;
+      }
+
+      // SQLite exhausted — pull from the network. In Reel mode the user has
+      // no "tap to load more" affordance, so a single empty snapshot would
+      // dead-end the whole feed. Loop a few times until we either advance
+      // the cursor to 'done' or actually surface fresh items.
+      const MAX_NET_ATTEMPTS = 4;
+      let netArticles: Article[] = [];
+      for (let attempt = 0; attempt < MAX_NET_ATTEMPTS; attempt++) {
         const { articles: fromNet, cursors, allDone } =
           await fetchOlderFromNetwork(filter, cursorsRef.current);
         cursorsRef.current = cursors;
-        if (allDone && fromNet.length === 0) {
+        netArticles = fromNet;
+        if (fromNet.length > 0) break;
+        if (allDone) {
           noMoreRef.current = true;
           return;
         }
-        if (fromNet.length === 0) {
-          // Some cursors advanced but the snapshot we hit was empty/duplicate;
-          // let the user tap again to advance further (no infinite loop here
-          // because each call moves the cursor forward).
-          return;
-        }
-        // Re-query from SQLite so cursor pagination naturally orders things by
-        // pub_date and we don't have to merge/sort in memory.
-        const last = articles[articles.length - 1];
-        const merged = await queryArticles({
-          ...buildQueryOpts(filter, feeds, settings.hideReadArticles, 0),
-          cursor: last ? { pubDate: last.pubDate, id: last.id } : undefined,
-          limit: PAGE_SIZE * 2,
-        });
-        if (merged.length > 0) setArticles(prev => [...prev, ...merged]);
-      } else {
-        noMoreRef.current = true;
       }
+      if (netArticles.length === 0) return;
+
+      // Re-query from SQLite using the cursor captured BEFORE any awaits so
+      // we don't double-append items that the articleVersion effect may have
+      // already pulled in via a parallel reload.
+      const merged = await queryArticles({
+        ...buildQueryOpts(filter, feeds, settings.hideReadArticles, 0),
+        cursor: cursorBefore,
+        limit: PAGE_SIZE * 2,
+      });
+      if (merged.length === 0) return;
+      const knownIds = new Set(articlesRef.current.map(a => a.id));
+      const additions = merged.filter(a => !knownIds.has(a.id));
+      if (additions.length > 0) setArticles(prev => [...prev, ...additions]);
     } finally {
       loadingMoreRef.current = false;
       if (withSpinner) setLoadingMore(false);
     }
-  }, [filter, feeds, settings.hideReadArticles, articles, fetchOlderFromNetwork]);
+  }, [filter, feeds, settings.hideReadArticles, fetchOlderFromNetwork]);
 
   const handleLoadMore = useCallback(() => doLoadMore(true), [doLoadMore]);
   const handleLoadMoreSilent = useCallback(() => doLoadMore(false), [doLoadMore]);
@@ -419,7 +438,7 @@ function ReelList({
       bounces={false}
       overScrollMode="never"
       onEndReached={articles.length > 0 ? onEndReached : undefined}
-      onEndReachedThreshold={3}
+      onEndReachedThreshold={1.5}
       getItemLayout={(_, index) => ({
         length: itemHeight,
         offset: itemHeight * index,
@@ -428,8 +447,6 @@ function ReelList({
       initialScrollIndex={initialScrollIndex > 0 && initialScrollIndex < articles.length ? initialScrollIndex : undefined}
       onViewableItemsChanged={onViewableItemsChanged}
       viewabilityConfig={viewabilityConfig.current}
-      onEndReached={articles.length > 0 ? onEndReached : undefined}
-      onEndReachedThreshold={1.5}
       ListFooterComponent={
         articles.length > 0 ? <EndFooter loading={loadingMore} /> : null
       }

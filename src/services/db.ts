@@ -177,21 +177,30 @@ export function clearArticles(): void {
   db.execSync('DELETE FROM articles');
 }
 
+// Keep this list aligned with NAMED_ENTITIES in rss.ts.
+const NAMED_ENTITIES: Record<string, string> = {
+  nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+  hellip: '…', mdash: '—', ndash: '–', laquo: '«', raquo: '»',
+  ldquo: '“', rdquo: '”', lsquo: '‘', rsquo: '’', sbquo: '‚', bdquo: '„',
+  copy: '©', reg: '®', trade: '™', deg: '°', middot: '·', bull: '•',
+  iexcl: '¡', iquest: '¿', euro: '€', pound: '£', yen: '¥', cent: '¢',
+  times: '×', divide: '÷', plusmn: '±', frac12: '½', frac14: '¼', frac34: '¾',
+};
+
 function decodeEntities(text: string): string {
   return text
     .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)))
     .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&nbsp;/g, ' ');
+    .replace(/&([a-zA-Z]+);/g, (m, name) => NAMED_ENTITIES[name] ?? m);
 }
 
 export async function fixStoredEntities(): Promise<void> {
+  // Match numeric entities (&#NNN;) and any of the supported named entities.
+  // Previous filter only caught &#…; rows, leaving &hellip; / &mdash; / etc behind.
   const rows = await db.getAllAsync(
-    `SELECT id, title, summary FROM articles WHERE title LIKE '%&#%' OR summary LIKE '%&#%'`,
+    `SELECT id, title, summary FROM articles
+     WHERE title   LIKE '%&#%' OR summary LIKE '%&#%'
+        OR title   LIKE '%&_%;' OR summary LIKE '%&_%;'`,
   ) as { id: string; title: string; summary: string | null }[];
   if (rows.length === 0) return;
   return enqueueWrite(async () => {

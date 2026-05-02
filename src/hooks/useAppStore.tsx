@@ -15,6 +15,7 @@ import {
   fetchFeedMeta,
   fetchOlderPage,
   enrichWithImages,
+  initialCursorForFeed,
   PageCursor,
 } from '../services/rss';
 import { generateId, uuid } from '../utils/id';
@@ -168,18 +169,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const { articles, faviconUrl, nextPageUrl } = await fetchArticles(feed);
       await db.upsertArticles(articles);
       const unreadCount = articles.filter(a => !a.isRead).length;
-      const updated = { ...feed, lastFetched: Date.now(), unreadCount, faviconUrl: faviconUrl ?? feed.faviconUrl, nextPageUrl };
+      // If a refresh surfaces a fresh rel=next link, replace the stored one;
+      // otherwise keep whatever we had so the cursor doesn't get nuked.
+      const updated = {
+        ...feed,
+        lastFetched: Date.now(),
+        unreadCount,
+        faviconUrl: faviconUrl ?? feed.faviconUrl,
+        nextPageUrl: nextPageUrl ?? feed.nextPageUrl,
+      };
       await storage.saveFeed(updated);
       const allFeeds = await storage.getFeeds();
       dispatch({ type: 'SET_FEEDS', payload: allFeeds });
       dispatch({ type: 'BUMP_VERSION' });
-      // Enrich images async — only for articles that have no image from the feed
+      // Background OG-image enrichment — fetchArticles no longer does this,
+      // so we own the entire async lifecycle here. Re-upsert relies on the
+      // upsert's COALESCE clause to fill in image_url without clobbering
+      // anything else, then bumps version so the screen re-queries.
       const needsEnrich = articles.filter(a => !a.imageUrl);
       if (needsEnrich.length > 0) {
         enrichWithImages(articles).then(async () => {
           const gained = needsEnrich.filter(a => a.imageUrl);
           if (gained.length > 0) {
-            await db.upsertArticles(articles);
+            await db.upsertArticles(gained);
             dispatch({ type: 'BUMP_VERSION' });
           }
         }).catch(e => console.warn('Image enrichment error', e));
@@ -217,9 +229,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
     const results = await Promise.allSettled(
       feedsToFetch
-        .filter(f => (cursors[f.id]?.kind ?? 'urlPage') !== 'done')
+        .filter(f => cursors[f.id]?.kind !== 'done')
         .map(async feed => {
-          const cur = cursors[feed.id] ?? ({ kind: 'urlPage', page: 2 } as PageCursor);
+          // First call for this feed uses the rel=next URL captured on refresh
+          // (RFC 5005), falling back to URL-page heuristics, then Wayback.
+          const cur = cursors[feed.id] ?? initialCursorForFeed(feed);
           const { articles, cursor } = await fetchOlderPage(feed, cur, existingIds);
           nextCursors[feed.id] = cursor;
           return articles;
@@ -238,14 +252,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         enrichWithImages(fresh).then(async () => {
           const gained = needsEnrich.filter(a => a.imageUrl);
           if (gained.length > 0) {
-            await db.upsertArticles(fresh);
+            await db.upsertArticles(gained);
             dispatch({ type: 'BUMP_VERSION' });
           }
         }).catch(e => console.warn('Image enrichment error', e));
       }
     }
 
-    const allDone = feedsToFetch.every(f => (nextCursors[f.id]?.kind ?? 'urlPage') === 'done');
+    const allDone = feedsToFetch.every(f => nextCursors[f.id]?.kind === 'done');
     return { articles: fresh, cursors: nextCursors, allDone };
   }, [state.feeds]);
 
