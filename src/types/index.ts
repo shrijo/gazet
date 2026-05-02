@@ -14,6 +14,7 @@ export interface Feed {
   lastFetched?: number;
   unreadCount: number;
   createdAt: number;
+  nextPageUrl?: string; // Atom RFC 5005 <link rel="next"> — URL for loading older articles
 }
 
 export interface Article {

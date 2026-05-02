@@ -10,6 +10,9 @@ import {
   ActivityIndicator,
   useWindowDimensions,
 } from 'react-native';
+import { Image as ExpoImage } from 'expo-image';
+
+const AnimatedExpoImage = Animated.createAnimatedComponent(ExpoImage);
 import { VideoView, useVideoPlayer } from 'expo-video';
 import { LinearGradient } from 'expo-linear-gradient';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -18,7 +21,7 @@ import { useNavigation } from '@react-navigation/native';
 import { useDrawer } from '../navigation/Drawer';
 import { useSettingsDrawer } from '../navigation/SettingsDrawer';
 import { useTheme } from '../theme';
-import { Text, Icon, Card, Skeleton, Divider } from '../components';
+import { Text, Icon, Card, Divider } from '../components';
 import { useAppStore } from '../hooks/useAppStore';
 import { queryArticles, QueryOptions } from '../services/db';
 import { Article, Feed, FeedFilter, ViewMode } from '../types';
@@ -98,16 +101,18 @@ export function ArticlesScreen() {
 
   useEffect(() => {
     if (loading || articleVersion === 0) return;
+    // A refresh may have brought in new articles — allow pagination to retry
+    noMoreRef.current = false;
     const count = Math.max(articleCountRef.current, PAGE_SIZE);
     queryArticles({ ...buildQueryOpts(filter, feeds, settings.hideReadArticles, 0), limit: count })
       .then(setArticles);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [articleVersion]);
 
-  const handleLoadMore = useCallback(async () => {
+  const doLoadMore = useCallback(async (withSpinner: boolean) => {
     if (loadingMoreRef.current || noMoreRef.current) return;
     loadingMoreRef.current = true;
-    setLoadingMore(true);
+    if (withSpinner) setLoadingMore(true);
     try {
       // First: next page from local SQLite (fast, no network)
       const fresh = await queryArticles(
@@ -133,9 +138,12 @@ export function ArticlesScreen() {
       }
     } finally {
       loadingMoreRef.current = false;
-      setLoadingMore(false);
+      if (withSpinner) setLoadingMore(false);
     }
   }, [filter, feeds, settings.hideReadArticles, articles.length, fetchOlderFromNetwork]);
+
+  const handleLoadMore = useCallback(() => doLoadMore(true), [doLoadMore]);
+  const handleLoadMoreSilent = useCallback(() => doLoadMore(false), [doLoadMore]);
 
   const activeTab = React.useMemo(() => {
     if (filter.type === 'bookmarks') return 'bookmarks';
@@ -184,28 +192,6 @@ export function ArticlesScreen() {
     [handleArticlePress],
   );
 
-  if (loading) {
-    return (
-      <SafeAreaView
-        style={[styles.container, { backgroundColor: colors.background }]}
-        edges={['top']}
-      >
-        <Header title={filterLabel} viewMode={viewMode} onCycleView={cycleViewMode} />
-        <View style={{ padding: spacing[4], gap: spacing[3] }}>
-          {Array.from({ length: 4 }).map((_, i) => (
-            <Skeleton key={i} height={isCard ? 220 : 72} />
-          ))}
-        </View>
-        <BottomBar
-          activeTab={activeTab}
-          onMenu={drawer.open}
-          onFeed={() => setFilter({ type: 'all' })}
-          onSettings={() => settingsDrawer.open()}
-        />
-      </SafeAreaView>
-    );
-  }
-
   if (isReel) {
     return (
       <SafeAreaView
@@ -218,6 +204,8 @@ export function ArticlesScreen() {
           onPress={handleArticlePress}
           onRefresh={refreshAll}
           refreshing={refreshing}
+          onLoadMore={handleLoadMoreSilent}
+          loading={loading}
         />
         <BottomBar
           activeTab={activeTab}
@@ -263,15 +251,17 @@ export function ArticlesScreen() {
           articles.length > 0 ? <EndFooter loading={loadingMore} /> : null
         }
         ListEmptyComponent={
-          <View style={styles.empty}>
-            <Icon name="newspaper-outline" size={48} color="secondary" />
-            <Text variant="headingMd" color="secondary" style={{ marginTop: spacing[3] }}>
-              No articles
-            </Text>
-            <Text variant="bodyMd" color="tertiary" style={{ textAlign: 'center', marginTop: spacing[1] }}>
-              Add feeds via the Menu
-            </Text>
-          </View>
+          !loading ? (
+            <View style={styles.empty}>
+              <Icon name="newspaper-outline" size={48} color="secondary" />
+              <Text variant="headingMd" color="secondary" style={{ marginTop: spacing[3] }}>
+                No articles
+              </Text>
+              <Text variant="bodyMd" color="tertiary" style={{ textAlign: 'center', marginTop: spacing[1] }}>
+                Add feeds via the Menu
+              </Text>
+            </View>
+          ) : null
         }
       />
 
@@ -294,11 +284,15 @@ function ReelList({
   onPress,
   onRefresh,
   refreshing,
+  onLoadMore,
+  loading,
 }: {
   articles: Article[];
   onPress: (article: Article) => void;
   onRefresh: () => void;
   refreshing: boolean;
+  loading?: boolean;
+  onLoadMore: () => void;
 }) {
   const { colors, spacing } = useTheme();
   const { height: windowHeight } = useWindowDimensions();
@@ -331,11 +325,14 @@ function ReelList({
       data={articles}
       keyExtractor={a => a.id}
       renderItem={renderReel}
-      pagingEnabled
       showsVerticalScrollIndicator={false}
       snapToInterval={itemHeight}
       snapToAlignment="start"
       decelerationRate="fast"
+      bounces={false}
+      overScrollMode="never"
+      onEndReached={articles.length > 0 ? onLoadMore : undefined}
+      onEndReachedThreshold={3}
       getItemLayout={(_, index) => ({
         length: itemHeight,
         offset: itemHeight * index,
@@ -355,15 +352,17 @@ function ReelList({
         />
       }
       ListEmptyComponent={
-        <View style={[styles.empty, { height: itemHeight }]}>
-          <Icon name="newspaper-outline" size={48} color="secondary" />
-          <Text variant="headingMd" color="secondary" style={{ marginTop: spacing[3] }}>
-            No articles
-          </Text>
-          <Text variant="bodyMd" color="tertiary" style={{ textAlign: 'center', marginTop: spacing[1] }}>
-            Add feeds via the Menu
-          </Text>
-        </View>
+        !loading ? (
+          <View style={[styles.empty, { height: itemHeight }]}>
+            <Icon name="newspaper-outline" size={48} color="secondary" />
+            <Text variant="headingMd" color="secondary" style={{ marginTop: spacing[3] }}>
+              No articles
+            </Text>
+            <Text variant="bodyMd" color="tertiary" style={{ textAlign: 'center', marginTop: spacing[1] }}>
+              Add feeds via the Menu
+            </Text>
+          </View>
+        ) : null
       }
     />
   );
@@ -591,13 +590,14 @@ function KenBurnsImage({ uri, isActive }: { uri: string; isActive: boolean }) {
   const translateY = progress.interpolate({ inputRange: [0, 1], outputRange: [0, ty] });
 
   return (
-    <Animated.Image
+    <AnimatedExpoImage
       source={{ uri }}
       style={[
         StyleSheet.absoluteFill,
         { transform: [{ scale }, { translateX }, { translateY }] },
       ]}
-      resizeMode="cover"
+      contentFit="cover"
+      cachePolicy="disk"
     />
   );
 }
@@ -725,17 +725,14 @@ function Header({
 
 const FadeImage = React.memo(function FadeImage({ uri, style }: { uri: string; style: any }) {
   const { colors } = useTheme();
-  const opacity = useRef(new Animated.Value(0)).current;
-  const onLoad = useCallback(() => {
-    Animated.timing(opacity, { toValue: 1, duration: 250, useNativeDriver: true }).start();
-  }, [opacity]);
   return (
     <View style={[style, { backgroundColor: colors.skeleton, overflow: 'hidden' }]}>
-      <Animated.Image
+      <ExpoImage
         source={{ uri }}
-        style={[StyleSheet.absoluteFill, { opacity }]}
-        resizeMode="cover"
-        onLoad={onLoad}
+        style={StyleSheet.absoluteFill}
+        contentFit="cover"
+        cachePolicy="disk"
+        transition={250}
       />
     </View>
   );

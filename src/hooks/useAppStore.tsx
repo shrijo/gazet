@@ -3,13 +3,17 @@ import React, {
   useContext,
   useReducer,
   useEffect,
+  useRef,
   useCallback,
 } from 'react';
+import { AppState as RNAppState, AppStateStatus } from 'react-native';
 import { Folder, Feed, Settings, FeedFilter, Article } from '../types';
 import * as storage from '../services/storage';
 import * as db from '../services/db';
 import { fetchArticles, fetchFeedMeta, fetchOlderArticles, enrichWithImages } from '../services/rss';
 import { generateId, uuid } from '../utils/id';
+
+const STALE_AFTER_MS = 15 * 60 * 1000; // 15 minutes
 
 interface AppState {
   folders: Folder[];
@@ -120,23 +124,53 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     })();
   }, []);
 
+  // Foreground-resume refresh: re-fetch feeds that haven't been updated in 15+ minutes
+  const appStateRef = useRef<AppStateStatus>(RNAppState.currentState);
+  const feedsRef = useRef<Feed[]>(state.feeds);
+  useEffect(() => { feedsRef.current = state.feeds; }, [state.feeds]);
+
+  useEffect(() => {
+    const sub = RNAppState.addEventListener('change', (nextState: AppStateStatus) => {
+      const wasBackground = appStateRef.current !== 'active';
+      appStateRef.current = nextState;
+      if (nextState === 'active' && wasBackground) {
+        const stale = feedsRef.current.filter(
+          f => !f.lastFetched || Date.now() - f.lastFetched > STALE_AFTER_MS,
+        );
+        if (stale.length > 0) {
+          dispatch({ type: 'SET_REFRESHING', payload: true });
+          Promise.allSettled(stale.map(f => refreshFeed(f))).then(() => {
+            dispatch({ type: 'SET_REFRESHING', payload: false });
+          });
+        }
+      }
+    });
+    return () => sub.remove();
+  // refreshFeed is stable (no deps), feedsRef avoids re-subscribing on every feed change
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const refreshFeed = useCallback(async (feed: Feed) => {
     try {
-      const { articles, faviconUrl } = await fetchArticles(feed);
+      const { articles, faviconUrl, nextPageUrl } = await fetchArticles(feed);
       await db.upsertArticles(articles);
       const unreadCount = articles.filter(a => !a.isRead).length;
-      const updated = { ...feed, lastFetched: Date.now(), unreadCount, faviconUrl: faviconUrl ?? feed.faviconUrl };
+      const updated = { ...feed, lastFetched: Date.now(), unreadCount, faviconUrl: faviconUrl ?? feed.faviconUrl, nextPageUrl };
       await storage.saveFeed(updated);
       const allFeeds = await storage.getFeeds();
       dispatch({ type: 'SET_FEEDS', payload: allFeeds });
       dispatch({ type: 'BUMP_VERSION' });
-      // Enrich images async — articles already in DB, images fill in when ready
-      enrichWithImages(articles).then(async enriched => {
-        if (enriched.some(a => a.imageUrl)) {
-          await db.upsertArticles(enriched);
-          dispatch({ type: 'BUMP_VERSION' });
-        }
-      });
+      // Enrich images async — only for articles that have no image from the feed
+      const needsEnrich = articles.filter(a => !a.imageUrl);
+      if (needsEnrich.length > 0) {
+        enrichWithImages(articles).then(async () => {
+          const gained = needsEnrich.filter(a => a.imageUrl);
+          if (gained.length > 0) {
+            await db.upsertArticles(articles);
+            dispatch({ type: 'BUMP_VERSION' });
+          }
+        }).catch(e => console.warn('Image enrichment error', e));
+      }
     } catch (e) {
       console.warn('Feed fetch error', feed.url, e);
     }
@@ -165,11 +199,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       feedsToFetch.map(feed => fetchOlderArticles(feed, page, existingIds)),
     );
     const fresh: Article[] = [];
-    for (const r of results) {
-      if (r.status === 'fulfilled') fresh.push(...r.value);
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.status !== 'fulfilled') continue;
+      const { articles, nextPageUrl } = r.value;
+      fresh.push(...articles);
+      // Persist updated Atom next-page URL so the next "load more" follows it
+      if (nextPageUrl !== undefined) {
+        const updated = { ...feedsToFetch[i], nextPageUrl };
+        storage.saveFeed(updated).catch(() => {});
+      }
     }
     if (fresh.length > 0) {
       await db.upsertArticles(fresh);
+      const needsEnrich = fresh.filter(a => !a.imageUrl);
+      if (needsEnrich.length > 0) {
+        enrichWithImages(fresh).then(async () => {
+          const gained = needsEnrich.filter(a => a.imageUrl);
+          if (gained.length > 0) {
+            await db.upsertArticles(fresh);
+            dispatch({ type: 'BUMP_VERSION' });
+          }
+        }).catch(e => console.warn('Image enrichment error', e));
+      }
     }
     return fresh;
   }, [state.feeds]);

@@ -225,7 +225,7 @@ export function DrawerContent() {
       <Modal
         visible={showFeedActions}
         animationType="slide"
-        presentationStyle="pageSheet"
+        presentationStyle="fullScreen"
         onRequestClose={() => setShowFeedActions(false)}
       >
         <SafeAreaView
@@ -237,7 +237,7 @@ export function DrawerContent() {
               {selectedFeed?.title}
             </Text>
             <TouchableOpacity onPress={() => setShowFeedActions(false)}>
-              <Text variant="labelMd" color="secondary">Close</Text>
+              <Icon name="close-outline" size={24} color="secondary" />
             </TouchableOpacity>
           </View>
 
@@ -345,7 +345,7 @@ export function DrawerContent() {
           <View style={[styles.modalHeader, { paddingHorizontal: spacing[4] }]}>
             <Text variant="headingMd">New Folder</Text>
             <TouchableOpacity onPress={() => setShowAddFolder(false)}>
-              <Text variant="labelMd" color="secondary">Close</Text>
+              <Icon name="close-outline" size={24} color="secondary" />
             </TouchableOpacity>
           </View>
           <View style={{ paddingHorizontal: spacing[4], gap: spacing[3] }}>
@@ -535,7 +535,7 @@ function AddFeedModal({
           <View style={[styles.modalHeader, { paddingHorizontal: spacing[4] }]}>
             <Text variant="headingMd">Add Feed</Text>
             <TouchableOpacity onPress={onClose}>
-              <Text variant="labelMd" color="secondary">Close</Text>
+              <Icon name="close-outline" size={24} color="secondary" />
             </TouchableOpacity>
           </View>
 
