@@ -227,10 +227,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     );
 
     const fresh: Article[] = [];
-    for (let i = 0; i < results.length; i++) {
-      const r = results[i];
+    for (const r of results) {
       if (r.status !== 'fulfilled') continue;
-      fresh.push(...r.value.articles);
+      fresh.push(...r.value);
     }
     if (fresh.length > 0) {
       await db.upsertArticles(fresh);
