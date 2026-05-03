@@ -11,8 +11,6 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { Image as ExpoImage } from 'expo-image';
-
-const AnimatedExpoImage = Animated.createAnimatedComponent(ExpoImage);
 import { VideoView, useVideoPlayer } from 'expo-video';
 import { LinearGradient } from 'expo-linear-gradient';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -729,16 +727,22 @@ function KenBurnsImage({ uri, isActive }: { uri: string; isActive: boolean }) {
   const translateX = progress.interpolate({ inputRange: [0, 1], outputRange: [0, tx] });
   const translateY = progress.interpolate({ inputRange: [0, 1], outputRange: [0, ty] });
 
+  // expo-image doesn't reliably bridge native-driver transforms, so apply the
+  // animation to a wrapping Animated.View and keep the Image plain.
   return (
-    <AnimatedExpoImage
-      source={{ uri }}
+    <Animated.View
       style={[
         StyleSheet.absoluteFill,
         { transform: [{ scale }, { translateX }, { translateY }] },
       ]}
-      contentFit="cover"
-      cachePolicy="disk"
-    />
+    >
+      <ExpoImage
+        source={{ uri }}
+        style={StyleSheet.absoluteFill}
+        contentFit="cover"
+        cachePolicy="disk"
+      />
+    </Animated.View>
   );
 }
 
