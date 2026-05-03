@@ -273,6 +273,20 @@ async function fetchXml(url: string): Promise<any> {
   return parser.parse(text);
 }
 
+// If a user pasted a site/channel URL instead of the feed URL, try a few
+// well-known suffixes so things still work. Returns the first URL whose
+// response actually parses as XML.
+async function discoverFeedUrl(url: string): Promise<string | undefined> {
+  const candidates = [url, `${url.replace(/\/$/, '')}/rss`, `${url.replace(/\/$/, '')}/feed`, `${url.replace(/\/$/, '')}/feed/`, `${url.replace(/\/$/, '')}/atom.xml`, `${url.replace(/\/$/, '')}/index.xml`];
+  for (const c of candidates) {
+    try {
+      await fetchXml(c);
+      return c;
+    } catch { /* try next */ }
+  }
+  return undefined;
+}
+
 // Enrich every image-less article via OG-image scraping, with a fixed
 // concurrency window so a 30-item load-more doesn't fan out into 30 parallel
 // HTTP requests. No per-batch cap — older articles deserve images too.
@@ -405,13 +419,18 @@ export async function fetchOlderPage(
     for (const url of paginatedUrls(feed.url, cursor.page)) {
       try {
         const doc = await fetchXml(url);
-        const fresh = parseDoc(doc, feed, now).filter(a => !existingIds.has(a.id));
+        const parsed = parseDoc(doc, feed, now);
+        const fresh = parsed.filter(a => !existingIds.has(a.id));
+        if (__DEV__) console.log(`[older] ${feed.title} urlPage p${cursor.page} ${url} → ${parsed.length} parsed, ${fresh.length} fresh`);
         if (fresh.length > 0) {
           return { articles: fresh, cursor: { kind: 'urlPage', page: cursor.page + 1 } };
         }
-      } catch { /* try next variant */ }
+      } catch (e) {
+        if (__DEV__) console.log(`[older] ${feed.title} urlPage p${cursor.page} ${url} → error`, String(e));
+      }
     }
     // URL pagination exhausted for this feed — try the Wayback Machine next.
+    if (__DEV__) console.log(`[older] ${feed.title} urlPage exhausted, falling to Wayback`);
     return fetchOlderPage(feed, { kind: 'wbInit' }, existingIds);
   }
 
@@ -422,18 +441,27 @@ export async function fetchOlderPage(
   }
 
   if (cursor.kind === 'wb') {
-    const { snapshots, index } = cursor;
-    if (index >= snapshots.length) return { articles: [], cursor: { kind: 'done' } };
-    try {
-      const doc = await fetchXml(snapshots[index]);
-      const fresh = parseDoc(doc, feed, now).filter(a => !existingIds.has(a.id));
-      const next: PageCursor = { kind: 'wb', snapshots, index: index + 1 };
-      if (fresh.length > 0) return { articles: fresh, cursor: next };
-      // Empty snapshot — recurse to try the next one without spinning the UI.
-      return fetchOlderPage(feed, next, existingIds);
-    } catch {
-      return fetchOlderPage(feed, { kind: 'wb', snapshots, index: index + 1 }, existingIds);
+    // Bound per-call work: a feed with no real history can have many
+    // identical snapshots, and walking all 80 inside one loadMore would
+    // block every other feed via Promise.allSettled. Try a few, then
+    // hand back the still-advancing cursor so the user can scroll again.
+    const MAX_WB_PER_CALL = 4;
+    let { snapshots, index } = cursor;
+    let triedThisCall = 0;
+    while (triedThisCall < MAX_WB_PER_CALL) {
+      if (index >= snapshots.length) return { articles: [], cursor: { kind: 'done' } };
+      triedThisCall++;
+      try {
+        const doc = await fetchXml(snapshots[index]);
+        const fresh = parseDoc(doc, feed, now).filter(a => !existingIds.has(a.id));
+        index++;
+        const next: PageCursor = { kind: 'wb', snapshots, index };
+        if (fresh.length > 0) return { articles: fresh, cursor: next };
+      } catch {
+        index++;
+      }
     }
+    return { articles: [], cursor: { kind: 'wb', snapshots, index } };
   }
 
   return { articles: [], cursor: { kind: 'done' } };
@@ -469,21 +497,31 @@ async function fetchWaybackSnapshots(feedUrl: string): Promise<string[]> {
 
 export { enrichWithImages };
 
-export async function fetchFeedMeta(url: string): Promise<Partial<Feed>> {
-  const doc = await fetchXml(url);
+export async function fetchFeedMeta(url: string): Promise<Partial<Feed> & { url?: string }> {
+  // If the user pasted a site URL, sniff for the actual feed location.
+  let resolvedUrl = url;
+  let doc: any;
+  try {
+    doc = await fetchXml(url);
+  } catch {
+    const discovered = await discoverFeedUrl(url);
+    if (!discovered) throw new Error(`Could not find an RSS/Atom feed at ${url}`);
+    resolvedUrl = discovered;
+    doc = await fetchXml(discovered);
+  }
   const channel = doc?.rss?.channel ?? doc?.feed ?? {};
-  const title = getText(channel.title) || url;
+  const title = getText(channel.title) || resolvedUrl;
   const description = getText(channel.description) ?? getText(channel.subtitle);
 
   // Prefer the channel's own website link over the feed URL for favicon lookup,
   // so feeds hosted on third-party domains (e.g. FeedBurner) resolve the right site.
-  const channelLink = getText(channel.link) || url;
+  const channelLink = getText(channel.link) || resolvedUrl;
   const faviconUrl =
     toAbsoluteUrl(getText(channel.image?.url) || channel.image?.url) ??
     toAbsoluteUrl(channel['itunes:image']?.['@_href']) ??
     getFaviconUrl(channelLink);
 
-  return { title, description, faviconUrl };
+  return { title, description, faviconUrl, url: resolvedUrl };
 }
 
 export async function fetchArticles(feed: Feed): Promise<{ articles: Article[]; faviconUrl?: string; nextPageUrl?: string }> {

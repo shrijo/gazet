@@ -152,7 +152,10 @@ export function ArticlesScreen() {
   }, [articleVersion]);
 
   const doLoadMore = useCallback(async (withSpinner: boolean) => {
-    if (loadingMoreRef.current || noMoreRef.current) return;
+    if (loadingMoreRef.current || noMoreRef.current) {
+      if (__DEV__) console.log('[loadMore] skip', { loading: loadingMoreRef.current, noMore: noMoreRef.current });
+      return;
+    }
     loadingMoreRef.current = true;
     if (withSpinner) setLoadingMore(true);
     try {
@@ -163,6 +166,7 @@ export function ArticlesScreen() {
       const cursorBefore = lastBefore
         ? { pubDate: lastBefore.pubDate, id: lastBefore.id }
         : undefined;
+      if (__DEV__) console.log('[loadMore] start', { count: articlesRef.current.length, cursor: lastBefore?.title });
 
       // First: next page from local SQLite via cursor pagination so the offset
       // doesn't drift when articles get marked read during scrolling.
@@ -170,9 +174,11 @@ export function ArticlesScreen() {
         ...buildQueryOpts(filter, feeds, settings.hideReadArticles, 0),
         cursor: cursorBefore,
       });
+      if (__DEV__) console.log('[loadMore] sqlite returned', fresh.length);
       if (fresh.length > 0) {
         const knownIds = new Set(articlesRef.current.map(a => a.id));
         const additions = fresh.filter(a => !knownIds.has(a.id));
+        if (__DEV__) console.log('[loadMore] sqlite additions', additions.length);
         if (additions.length > 0) setArticles(prev => [...prev, ...additions]);
         return;
       }
@@ -182,17 +188,19 @@ export function ArticlesScreen() {
         return;
       }
 
-      // SQLite exhausted — pull from the network. In Reel mode the user has
-      // no "tap to load more" affordance, so a single empty snapshot would
-      // dead-end the whole feed. Loop a few times until we either advance
-      // the cursor to 'done' or actually surface fresh items.
-      const MAX_NET_ATTEMPTS = 4;
+      // SQLite exhausted — pull from the network. With Wayback bounded per
+      // call (rss.ts), a single fetchOlderFromNetwork returns quickly even
+      // when slow feeds need many calls to walk their history. Two attempts
+      // is enough to hop past one all-empty round.
+      const MAX_NET_ATTEMPTS = 2;
       let netArticles: Article[] = [];
       for (let attempt = 0; attempt < MAX_NET_ATTEMPTS; attempt++) {
+        if (__DEV__) console.log('[loadMore] network attempt', attempt + 1, 'cursors', cursorsRef.current);
         const { articles: fromNet, cursors, allDone } =
           await fetchOlderFromNetwork(filter, cursorsRef.current);
         cursorsRef.current = cursors;
         netArticles = fromNet;
+        if (__DEV__) console.log('[loadMore] network returned', fromNet.length, 'allDone', allDone);
         if (fromNet.length > 0) break;
         if (allDone) {
           noMoreRef.current = true;

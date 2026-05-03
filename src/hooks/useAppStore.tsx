@@ -265,12 +265,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const addFeed = useCallback(async (url: string, folderId?: string) => {
     const meta = await fetchFeedMeta(url);
-    const id = generateId(url);
+    // fetchFeedMeta resolves a site URL to its actual feed URL when possible.
+    const resolvedUrl = meta.url ?? url;
+    const id = generateId(resolvedUrl);
     const feed: Feed = {
       id,
       folderId,
-      title: meta.title ?? url,
-      url,
+      title: meta.title ?? resolvedUrl,
+      url: resolvedUrl,
       faviconUrl: meta.faviconUrl,
       description: meta.description,
       unreadCount: 0,
