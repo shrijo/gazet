@@ -195,7 +195,17 @@ export function ArticlesScreen() {
       const MAX_NET_ATTEMPTS = 2;
       let netArticles: Article[] = [];
       for (let attempt = 0; attempt < MAX_NET_ATTEMPTS; attempt++) {
-        if (__DEV__) console.log('[loadMore] network attempt', attempt + 1, 'cursors', cursorsRef.current);
+        if (__DEV__) {
+          // Summarise cursors instead of dumping 80-URL snapshot arrays.
+          const summary: Record<string, string> = {};
+          for (const [id, c] of Object.entries(cursorsRef.current)) {
+            summary[id] = c.kind === 'wb' ? `wb ${c.index}/${c.snapshots.length}`
+              : c.kind === 'urlPage' ? `urlPage p${c.page}`
+              : c.kind === 'nextUrl' ? `nextUrl`
+              : c.kind;
+          }
+          console.log('[loadMore] network attempt', attempt + 1, 'cursors', summary);
+        }
         const { articles: fromNet, cursors, allDone } =
           await fetchOlderFromNetwork(filter, cursorsRef.current);
         cursorsRef.current = cursors;
