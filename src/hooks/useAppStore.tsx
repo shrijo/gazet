@@ -20,7 +20,27 @@ import {
 } from '../services/rss';
 import { generateId, uuid } from '../utils/id';
 
-const STALE_AFTER_MS = 15 * 60 * 1000; // 15 minutes
+const STALE_AFTER_MS = 15 * 60 * 1000;       // background-resume cutoff
+const PULL_DEBOUNCE_MS = 30 * 1000;           // skip pull-to-refresh on feeds we just hit
+const REFRESH_CONCURRENCY = 6;                // max parallel feed fetches
+
+// Run async tasks with a fixed concurrency window. Used so a 50-feed refresh
+// doesn't fan out into 50 simultaneous network requests — mobile radios choke,
+// and the first feeds to complete take much longer than they should.
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<unknown>,
+): Promise<void> {
+  let cursor = 0;
+  const next = async (): Promise<void> => {
+    while (cursor < items.length) {
+      const idx = cursor++;
+      try { await worker(items[idx]); } catch { /* worker handles its own errors */ }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, next));
+}
 
 interface AppState {
   folders: Folder[];
@@ -102,9 +122,9 @@ interface AppContextValue {
   markRead:    (articleId: string) => Promise<void>;
   markAllRead: (feedId: string) => Promise<void>;
   toggleBookmark: (articleId: string) => Promise<boolean>;
-  // Refresh
-  refreshAll:  () => Promise<void>;
-  refreshFeed: (feed: Feed) => Promise<void>;
+  // Refresh — pass a filter to scope the refresh; omit for everything.
+  refreshFeeds: (filter?: FeedFilter) => Promise<void>;
+  refreshFeed:  (feed: Feed) => Promise<void>;
   // Per-feed cursors threaded by the screen so each "load more" advances the
   // pagination state machine (URL-page → Wayback Machine → done).
   fetchOlderFromNetwork: (
@@ -153,7 +173,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         );
         if (stale.length > 0) {
           dispatch({ type: 'SET_REFRESHING', payload: true });
-          Promise.allSettled(stale.map(f => refreshFeed(f))).then(() => {
+          runWithConcurrency(stale, REFRESH_CONCURRENCY, refreshFeed).then(() => {
             dispatch({ type: 'SET_REFRESHING', payload: false });
           });
         }
@@ -201,9 +221,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  const refreshAll = useCallback(async () => {
+  const refreshFeeds = useCallback(async (filter?: FeedFilter) => {
+    // Scope the refresh to whatever the user is actually looking at. Pulling
+    // on a single-feed view fetches just that feed; pulling on a folder
+    // fetches its members; pulling on "all" or bookmarks fetches everything.
+    let target: Feed[];
+    if (filter?.type === 'feed') {
+      target = state.feeds.filter(f => f.id === filter.feedId);
+    } else if (filter?.type === 'folder') {
+      target = state.feeds.filter(f => f.folderId === filter.folderId);
+    } else {
+      target = state.feeds;
+    }
+    // Debounce: skip feeds we just fetched (e.g. accidental triple-pulls).
+    const now = Date.now();
+    target = target.filter(f => !f.lastFetched || now - f.lastFetched > PULL_DEBOUNCE_MS);
+    if (target.length === 0) return;
+
     dispatch({ type: 'SET_REFRESHING', payload: true });
-    await Promise.allSettled(state.feeds.map(refreshFeed));
+    await runWithConcurrency(target, REFRESH_CONCURRENCY, refreshFeed);
     dispatch({ type: 'SET_REFRESHING', payload: false });
   }, [state.feeds, refreshFeed]);
 
@@ -370,7 +406,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     ]);
     dispatch({ type: 'SET_FOLDERS', payload: allFolders });
     dispatch({ type: 'SET_FEEDS', payload: allFeeds });
-    await Promise.allSettled(feeds.map(refreshFeed));
+    await runWithConcurrency(feeds, REFRESH_CONCURRENCY, refreshFeed);
   }, [refreshFeed]);
 
   const value: AppContextValue = {
@@ -386,7 +422,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     markRead,
     markAllRead,
     toggleBookmark,
-    refreshAll,
+    refreshFeeds,
     refreshFeed,
     fetchOlderFromNetwork,
     setFilter,

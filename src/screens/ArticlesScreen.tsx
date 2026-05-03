@@ -57,7 +57,7 @@ export function ArticlesScreen() {
   const settingsDrawer = useSettingsDrawer();
   const {
     state,
-    refreshAll,
+    refreshFeeds,
     fetchOlderFromNetwork,
     markRead,
     updateSettings,
@@ -266,6 +266,9 @@ export function ArticlesScreen() {
     [markRead, navigation],
   );
 
+  // Pull-to-refresh fetches just the feeds visible under the current filter.
+  const handleRefresh = useCallback(() => refreshFeeds(filter), [refreshFeeds, filter]);
+
   const cycleViewMode = useCallback(() => {
     const next: ViewMode = viewMode === 'card' ? 'list' : viewMode === 'list' ? 'reel' : 'card';
     // If we're about to enter reel mode, pre-compute the initial scroll index
@@ -302,7 +305,7 @@ export function ArticlesScreen() {
         <ReelList
           articles={articles}
           onPress={handleArticlePress}
-          onRefresh={refreshAll}
+          onRefresh={handleRefresh}
           refreshing={refreshing}
           onEndReached={handleLoadMore}
           loadingMore={loadingMore}
@@ -359,7 +362,7 @@ export function ArticlesScreen() {
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
-            onRefresh={refreshAll}
+            onRefresh={handleRefresh}
             tintColor={colors.accent}
           />
         }
